@@ -1,0 +1,83 @@
+###############################################################################
+# CDP 7.3.1.600 SP3 CHF1  /  Cloudera Manager 7.13.1  --  Environment File
+###############################################################################
+
+# ---------------------------------------------------------------------------
+# SSH / Bootstrap
+# ---------------------------------------------------------------------------
+SSH_USER="ec2-user"
+SSH_KEY="~/.ssh/id_rsa"
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+
+# ---------------------------------------------------------------------------
+# Cluster Hosts  (space-separated FQDN or IPs)
+# ---------------------------------------------------------------------------
+CM_SERVER_HOST=""
+ALL_HOSTS=""
+
+# ---------------------------------------------------------------------------
+# Cloudera Credentials  (from your Cloudera license key)
+# ---------------------------------------------------------------------------
+CLOUDERA_REPO_USER=""
+CLOUDERA_REPO_PASS=""
+
+# ---------------------------------------------------------------------------
+# Cloudera Manager Repository
+# ---------------------------------------------------------------------------
+CM_VERSION="7.13.1.0"
+CM_REPO_BASE_URL="https://archive.cloudera.com/p/cm7/${CM_VERSION}/redhat9/yum"
+CM_GPG_KEY_URL="https://archive.cloudera.com/p/cm7/${CM_VERSION}/redhat9/yum/RPM-GPG-KEY-cloudera"
+
+# ---------------------------------------------------------------------------
+# CDP Runtime Parcel
+# ---------------------------------------------------------------------------
+CDP_VERSION="7.3.1.600"
+CDP_PARCEL_URL="https://archive.cloudera.com/p/cdh7/${CDP_VERSION}/"
+
+# ---------------------------------------------------------------------------
+# Database  (MySQL / MariaDB on AWS RDS)
+# ---------------------------------------------------------------------------
+DB_HOST=""
+DB_PORT="3306"
+DB_ADMIN_USER="admin"
+DB_ADMIN_PASS=""
+
+# Per-service database passwords
+SCM_DB_PASS=""
+AMON_DB_PASS=""
+RMAN_DB_PASS=""
+HUE_DB_PASS=""
+HIVE_DB_PASS=""
+OOZIE_DB_PASS=""
+RANGER_DB_PASS=""
+
+# RDS Instance Identifier (for aws rds describe-db-instances)
+RDS_INSTANCE_ID=""
+
+# ---------------------------------------------------------------------------
+# EC2 Instance IDs  (space-separated, for 01_gather_ec2_info.sh)
+# ---------------------------------------------------------------------------
+EC2_INSTANCE_IDS=""
+
+# AWS Region
+AWS_REGION="us-east-1"
+
+# ---------------------------------------------------------------------------
+# Java
+# ---------------------------------------------------------------------------
+JAVA_HOME="/usr/lib/jvm/java-17-openjdk"
+
+# ---------------------------------------------------------------------------
+# TLS  (used by TLS setup and validation scripts)
+# ---------------------------------------------------------------------------
+KEYSTORE_PASS=""
+TRUSTSTORE_PASS=""
+TLS_CERT_DIR="/opt/cloudera/security/pki"
+CA_CERT_FILE="/etc/pki/tls/certs/ca-bundle.crt"
+
+# ---------------------------------------------------------------------------
+# Cloudera Manager API  (populated after CM is running)
+# ---------------------------------------------------------------------------
+CM_API_PORT="7180"
+CM_API_USER="admin"
+CM_API_PASS="admin"
