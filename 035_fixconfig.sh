@@ -203,6 +203,27 @@ echo "  JAVA_HOME=${JAVA_HOME:-not set}"
 java -version 2>&1 | head -1 | sed "s/^/    /"
 keytool -help 2>&1 | head -1 | sed "s/^/    keytool: /" || echo "    keytool: not found"
 
+
+###########################################################################
+# 7. Set swappiness
+###########################################################################
+echo ""
+echo "--- 7. Set swappiness ---"
+CONF_FILE="/etc/sysctl.d/99-swappiness.conf"
+
+# Check what is currently in the config file, if it exists
+if [ -f "$CONF_FILE" ]; then
+  CURRENT=$(cat "$CONF_FILE")
+  echo "  Before: ${CURRENT}"
+else
+  echo "  Before: (File does not exist)"
+fi
+
+# Write the persistent setting
+echo "vm.swappiness = 1" > "$CONF_FILE"
+
+echo "  After:  $(cat "$CONF_FILE")"
+
 ###########################################################################
 # Summary
 ###########################################################################
