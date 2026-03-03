@@ -277,16 +277,31 @@ class MetadataExtractor:
                     cols.append((name, ctype))
         return cols
 
-    def get_partitions(self, database: str, table: str) -> List[str]:
+    def get_partitions(self, database: str, table: str,
+                       partition_columns: Optional[List[str]] = None) -> List[str]:
         try:
             rows = self.client.execute_delimited(
                 f"SHOW PARTITIONS `{database}`.`{table}`"
             )
+            if not partition_columns:
+                partition_columns = []
+            num_pcols = len(partition_columns)
+            seen = set()
             parts = []
             for row in rows:
-                joined = "/".join(c.strip() for c in row if c.strip())
-                if joined and not joined.startswith("Total"):
-                    parts.append(joined)
+                if num_pcols > 0 and len(row) >= num_pcols:
+                    segments = []
+                    for idx in range(num_pcols):
+                        val = row[idx].strip()
+                        segments.append("{}={}".format(partition_columns[idx], val))
+                    key = "/".join(segments)
+                else:
+                    key = "/".join(c.strip() for c in row if c.strip())
+                if not key or key.startswith("Total"):
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    parts.append(key)
             return parts
         except RuntimeError:
             return []
@@ -335,14 +350,16 @@ class MetadataExtractor:
         ddl_lower = meta.create_ddl.lower()
         if "partitioned by" in ddl_lower:
             meta.is_partitioned = True
-            meta.partitions = self.get_partitions(database, table)
             m = re.search(r'PARTITIONED BY\s*\((.*?)\)', meta.create_ddl,
                           re.IGNORECASE | re.DOTALL)
             if m:
                 for col_def in m.group(1).split(","):
                     col_name = col_def.strip().split()[0].strip("`")
                     part_cols.append(col_name)
-        meta.partition_columns = part_cols
+            meta.partition_columns = part_cols
+            meta.partitions = self.get_partitions(database, table, part_cols)
+        else:
+            meta.partition_columns = part_cols
         meta.grants = self.get_grants(database, table)
         return meta
 
