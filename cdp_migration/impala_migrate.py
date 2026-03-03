@@ -243,10 +243,14 @@ class MetadataExtractor:
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped.startswith("+") or stripped.startswith("|"):
+            if stripped.startswith("+"):
+                continue
+            if stripped.startswith("|"):
                 cleaned = stripped.strip("|").strip()
-                if cleaned and not cleaned.startswith("---"):
+                if cleaned and cleaned.lower() != "result":
                     lines.append(cleaned)
+            elif stripped.lower() == "result":
+                continue
             else:
                 lines.append(stripped)
         return "\n".join(lines)
