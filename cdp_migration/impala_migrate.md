@@ -402,6 +402,91 @@ the Ranger Admin UI.
 | **External, partitioned** | DDL + per-partition data -> EFS | DDL on target, data from EFS, `RECOVER PARTITIONS` |
 | **Managed, non-partitioned** | DDL + data -> EFS | DDL on target, data from EFS -> target HDFS |
 | **Managed, partitioned** | DDL + per-partition data -> EFS | DDL on target, data from EFS, `RECOVER PARTITIONS` + `COMPUTE INCREMENTAL STATS` |
+| **Kudu** | DDL + grants only (no data) | DDL with rewritten `kudu.master_addresses` (no data) |
 
 For `efs-direct` strategy, the target table LOCATION is rewritten to
 point directly to the EFS staging path, eliminating the second data copy.
+
+---
+
+## Kudu Tables
+
+Kudu-backed tables (`STORED AS KUDU`) are handled differently because
+Kudu stores data in its own storage engine, not as files on HDFS.
+
+### How `impala_migrate.py` handles Kudu tables
+
+- **Detection**: Automatically detected via `STORED AS KUDU` in the DDL
+- **Export**: Saves DDL, grants, and row count to the manifest. **Skips data copy** (logged clearly)
+- **Import**: Creates the table on the target, **rewrites `kudu.master_addresses`** to point to the target Kudu masters. Skips data load, partition recovery, and stats
+- **`list-tables`**: Shows Kudu tables with type `KUDU`
+
+### Data migration with `kudu_migrate.py`
+
+Kudu data is migrated separately using `kudu_migrate.py`, which wraps
+the native `kudu table copy` CLI tool for direct cluster-to-cluster copy.
+
+#### Prerequisites
+
+- `kudu` CLI on `$PATH` (ships with CDP)
+- Network connectivity between source and target Kudu masters
+- `SOURCE_KUDU_MASTERS` and `TARGET_KUDU_MASTERS` set in `impala_migrate.env`
+
+#### Commands
+
+```bash
+# Copy a single Kudu table
+python3 kudu_migrate.py copy-table -t impala::sales.orders
+
+# Copy with row count verification
+python3 kudu_migrate.py copy-table -t impala::sales.orders --verify-after
+
+# Copy all Kudu tables in a database
+python3 kudu_migrate.py copy-db -d sales
+
+# Verify row counts between clusters
+python3 kudu_migrate.py verify -d sales
+
+# List Kudu tables on source
+python3 kudu_migrate.py list-tables -d sales
+
+# Dry-run
+python3 kudu_migrate.py copy-table -t impala::sales.orders --dry-run
+```
+
+#### Options
+
+| Flag | Description |
+|---|---|
+| `--env FILE` | Path to impala_migrate.env |
+| `--source-masters HOST` | Override source Kudu masters |
+| `--target-masters HOST` | Override target Kudu masters |
+| `--dst-table NAME` | Target table name if different from source |
+| `--predicates JSON` | JSON predicates for partial copy |
+| `--verify-after` | Verify row counts after copy |
+| `--dry-run` | Show what would be done |
+
+### Full Kudu migration workflow
+
+```bash
+# Step 1: impala_migrate.py creates DDL on the target (no data)
+python3 impala_migrate.py export-db -d sales
+python3 impala_migrate.py import-db -d sales
+
+# Step 2: kudu_migrate.py copies the data directly between Kudu clusters
+python3 kudu_migrate.py copy-db -d sales
+
+# Step 3: verify
+python3 kudu_migrate.py verify -d sales
+```
+
+### Configuration
+
+Add these to `impala_migrate.env`:
+
+```bash
+SOURCE_KUDU_MASTERS="src-kudu1:7051,src-kudu2:7051,src-kudu3:7051"
+TARGET_KUDU_MASTERS="tgt-kudu1:7051,tgt-kudu2:7051,tgt-kudu3:7051"
+```
+
+`kudu_migrate.py` shares the same `impala_migrate.env` config file.
