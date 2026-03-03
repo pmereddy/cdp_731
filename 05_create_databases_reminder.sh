@@ -32,27 +32,22 @@ banner "Phase 4: Database Creation Reminder"
 # ---------------------------------------------------------------------------
 # Service-to-database mapping
 # ---------------------------------------------------------------------------
-declare -A DB_MAP
-DB_MAP=(
-  [scm]="SCM_DB_PASS"
-  [amon]="AMON_DB_PASS"
-  [rman]="RMAN_DB_PASS"
-  [hue]="HUE_DB_PASS"
-  [hivemetastore]="HIVE_DB_PASS"
-  [oozie]="OOZIE_DB_PASS"
-  [ranger]="RANGER_DB_PASS"
-)
+# 2. Define the values using a consistent variable prefix (e.g., DB_MAP_<key>)
+DB_MAP_scm="SCM_DB_PASS"
+DB_MAP_amon="AMON_DB_PASS"
+DB_MAP_rman="RMAN_DB_PASS"
+DB_MAP_hue="HUE_DB_PASS"
+DB_MAP_hivemetastore="HIVE_DB_PASS"
+DB_MAP_oozie="OOZIE_DB_PASS"
+DB_MAP_ranger="RANGER_DB_PASS"
 
-declare -A USER_MAP
-USER_MAP=(
-  [scm]="scm"
-  [amon]="amon"
-  [rman]="rman"
-  [hue]="hue"
-  [hivemetastore]="hive"
-  [oozie]="oozie"
-  [ranger]="ranger"
-)
+USER_MAP_scm="scm"
+USER_MAP_amon="amon"
+USER_MAP_rman="rman"
+USER_MAP_hue="hue"
+USER_MAP_hivemetastore="hive"
+USER_MAP_oozie="oozie"
+USER_MAP_ranger="ranger"
 
 # ---------------------------------------------------------------------------
 # Generate SQL
@@ -74,9 +69,11 @@ USER_MAP=(
 HEADER
 
   for db in scm amon rman hue hivemetastore oozie ranger; do
-    user="${USER_MAP[$db]}"
-    pass_var="${DB_MAP[$db]}"
-    pass="${!pass_var}"
+    user_var="USER_MAP_${db}"
+    pass_var="DB_MAP_${db}"
+    user="${!user_var}"
+    passo="${!pass_var}"
+    pass="${!passo}"
 
     cat <<SQL
 -- ---------------------------------------------------
@@ -87,16 +84,16 @@ CREATE DATABASE IF NOT EXISTS \`${db}\`
   DEFAULT COLLATE utf8_general_ci;
 
 CREATE USER IF NOT EXISTS '${user}'@'localhost'
-  IDENTIFIED WITH mysql_native_password BY '${pass}';
+  IDENTIFIED BY '${pass}';
 
 CREATE USER IF NOT EXISTS '${user}'@'%'
-  IDENTIFIED WITH mysql_native_password BY '${pass}';
+  IDENTIFIED BY '${pass}';
 
 ALTER USER '${user}'@'localhost'
-  IDENTIFIED WITH mysql_native_password BY '${pass}';
+  IDENTIFIED BY '${pass}';
 
 ALTER USER '${user}'@'%'
-  IDENTIFIED WITH mysql_native_password BY '${pass}';
+  IDENTIFIED BY '${pass}';
 
 GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${user}'@'localhost';
 GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${user}'@'%';
