@@ -3,7 +3,8 @@
 # run_all.sh -- Run a command on all cluster hosts and display results
 #
 # Usage:
-#   ./run_all.sh <command>                  # run as SSH_USER
+#   ./run_all.sh <command>                  # run with SSH key (default)
+#   ./run_all.sh -w <command>               # prompt for SSH password
 #   ./run_all.sh -s <command>               # run with sudo
 #   ./run_all.sh -e /path/to/.env <command> # use alternate .env
 #   ./run_all.sh -p <command>               # run in parallel
@@ -11,9 +12,10 @@
 #
 # Examples:
 #   ./run_all.sh "hostname -f && uptime"
-#   ./run_all.sh -s "systemctl status cloudera-scm-agent"
+#   ./run_all.sh -w "hostname -f"
+#   ./run_all.sh -ws "systemctl status cloudera-scm-agent"
 #   ./run_all.sh -s "cat /etc/cloudera-scm-agent/config.ini | grep server_host"
-#   ./run_all.sh -sp "df -h | grep -v tmpfs"
+#   ./run_all.sh -wsp "df -h | grep -v tmpfs"
 ###############################################################################
 set -uo pipefail
 
@@ -24,6 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 USE_SUDO=false
 PARALLEL=false
+USE_PASSWORD=false
+SSH_PASS=""
 ENV_FILE="${SCRIPT_DIR}/.env"
 
 # ---------------------------------------------------------------------------
@@ -46,15 +50,18 @@ Usage: $(basename "$0") [OPTIONS] <command>
 Run a command on all cluster hosts defined in .env and display results.
 
 Options:
+  -w            Use password auth (prompts for SSH password)
   -s            Run the command with sudo
   -p            Run on all hosts in parallel (output may interleave)
-  -e FILE       Use a specific .env file (default: ./env)
+  -e FILE       Use a specific .env file (default: ./.env)
   -h            Show this help message
 
 Examples:
   $(basename "$0") "hostname -f"
+  $(basename "$0") -w "hostname -f"
+  $(basename "$0") -ws "systemctl status cloudera-scm-agent"
   $(basename "$0") -s "yum list installed | grep cloudera"
-  $(basename "$0") -sp "free -h"
+  $(basename "$0") -wsp "free -h"
   $(basename "$0") -e /tmp/other.env "uptime"
 EOF
   exit 0
@@ -63,8 +70,9 @@ EOF
 # ---------------------------------------------------------------------------
 # Parse options
 # ---------------------------------------------------------------------------
-while getopts ":spe:h" opt; do
+while getopts ":wspe:h" opt; do
   case ${opt} in
+    w) USE_PASSWORD=true ;;
     s) USE_SUDO=true ;;
     p) PARALLEL=true ;;
     e) ENV_FILE="${OPTARG}" ;;
@@ -93,14 +101,30 @@ fi
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
-for var in ALL_HOSTS SSH_USER SSH_KEY; do
+for var in ALL_HOSTS SSH_USER; do
   if [[ -z "${!var:-}" ]]; then
     echo -e "${C_RED}Error: ${var} is not set in ${ENV_FILE}${C_RST}" >&2
     exit 1
   fi
 done
 
-SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10}"
+if [[ "${USE_PASSWORD}" == "true" ]]; then
+  if ! command -v sshpass &>/dev/null; then
+    echo -e "${C_RED}Error: 'sshpass' is required for password auth but not found.${C_RST}" >&2
+    echo -e "${C_RED}Install it with: sudo dnf install -y sshpass  (or:  sudo yum install -y sshpass)${C_RST}" >&2
+    exit 1
+  fi
+  read -rsp "SSH password for ${SSH_USER}: " SSH_PASS < /dev/tty
+  echo ""
+  export SSHPASS="${SSH_PASS}"
+  SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o PubkeyAuthentication=no}"
+else
+  if [[ -z "${SSH_KEY:-}" ]]; then
+    echo -e "${C_RED}Error: SSH_KEY is not set in ${ENV_FILE} (use -w for password auth)${C_RST}" >&2
+    exit 1
+  fi
+  SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10}"
+fi
 
 read -ra HOSTS <<< "${ALL_HOSTS}"
 HOST_COUNT=${#HOSTS[@]}
@@ -108,9 +132,13 @@ HOST_COUNT=${#HOSTS[@]}
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
+AUTH_MODE="key"
+[[ "${USE_PASSWORD}" == "true" ]] && AUTH_MODE="password"
+
 echo ""
 echo -e "${C_BLD}Command:${C_RST}  ${REMOTE_CMD}"
 echo -e "${C_BLD}Sudo:${C_RST}     ${USE_SUDO}"
+echo -e "${C_BLD}Auth:${C_RST}     ${AUTH_MODE}"
 echo -e "${C_BLD}Hosts:${C_RST}    ${HOST_COUNT}"
 echo -e "${C_BLD}Parallel:${C_RST} ${PARALLEL}"
 echo ""
@@ -123,13 +151,20 @@ run_on_host() {
   local cmd="$2"
   local use_sudo="$3"
   local exit_code=0
+  local ssh_cmd_prefix
+
+  if [[ "${USE_PASSWORD}" == "true" ]]; then
+    ssh_cmd_prefix="sshpass -e ssh ${SSH_OPTS}"
+  else
+    ssh_cmd_prefix="ssh ${SSH_OPTS} -i ${SSH_KEY}"
+  fi
 
   if [[ "${use_sudo}" == "true" ]]; then
     # shellcheck disable=SC2086
-    output=$(ssh ${SSH_OPTS} -i "${SSH_KEY}" "${SSH_USER}@${host}" "sudo bash -c '${cmd}'" 2>&1) || exit_code=$?
+    output=$(${ssh_cmd_prefix} "${SSH_USER}@${host}" "sudo bash -c '${cmd}'" 2>&1) || exit_code=$?
   else
     # shellcheck disable=SC2086
-    output=$(ssh ${SSH_OPTS} -i "${SSH_KEY}" "${SSH_USER}@${host}" "${cmd}" 2>&1) || exit_code=$?
+    output=$(${ssh_cmd_prefix} "${SSH_USER}@${host}" "${cmd}" 2>&1) || exit_code=$?
   fi
 
   # Print results with host header
