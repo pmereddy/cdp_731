@@ -459,7 +459,8 @@ class DataMover:
                       database: str, table: str,
                       partition: Optional[str] = None):
         dest = self._staging_path(database, table, partition)
-        self._ensure_staging_dir(dest)
+        parent = os.path.dirname(dest.rstrip("/"))
+        self._ensure_staging_dir(parent)
         if strategy == "distcp":
             cmd = [
                 self.cfg.HADOOP_BIN, "distcp",
@@ -472,8 +473,11 @@ class DataMover:
             cmd.extend([hdfs_src.rstrip("/") + "/", f"file://{dest}"])
             self._run(cmd, f"distcp HDFS->EFS {database}.{table}")
         elif strategy in ("hdfs-cp", "efs-direct"):
-            cmd = [self.cfg.HDFS_BIN, "dfs", "-get", "-f",
-                   hdfs_src.rstrip("/") + "/*", dest + "/"]
+            if os.path.isdir(dest):
+                import shutil
+                shutil.rmtree(dest)
+            cmd = [self.cfg.HDFS_BIN, "dfs", "-get",
+                   hdfs_src.rstrip("/"), dest]
             self._run(cmd, f"hdfs-get HDFS->EFS {database}.{table}")
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -496,7 +500,7 @@ class DataMover:
             self._run(cmd, f"distcp EFS->HDFS {database}.{table}")
         elif strategy == "hdfs-cp":
             cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f",
-                   src + "/*", hdfs_dest.rstrip("/") + "/"]
+                   src + "/.", hdfs_dest.rstrip("/")]
             self._run(cmd, f"hdfs-put EFS->HDFS {database}.{table}")
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -668,16 +672,12 @@ class MigrationEngine:
             log.info("Step 3/4: %sKudu table -- skipping data export "
                      "(use kudu_migrate.py for data)%s", _Y, _RST)
             result["actions"].append("skip_data(kudu)")
-        elif meta.is_partitioned:
-            log.info("Step 3/4: Copying data to EFS staging ...")
-            for i, part in enumerate(meta.partitions, 1):
-                part_path = os.path.join(meta.location, part)
-                log.info("  [%d/%d] Partition: %s", i, len(meta.partitions), part)
-                self.data_mover.export_to_efs(strategy, part_path,
-                                              database, table, partition=part)
-            result["actions"].append(f"export_data({len(meta.partitions)} partitions)")
         else:
             log.info("Step 3/4: Copying data to EFS staging ...")
+            log.info("  Source: %s", meta.location)
+            if meta.is_partitioned:
+                log.info("  Partitions: %d (copying entire directory tree)",
+                         len(meta.partitions))
             self.data_mover.export_to_efs(strategy, meta.location, database, table)
             result["actions"].append("export_data")
 
@@ -769,16 +769,9 @@ class MigrationEngine:
             log.info("Step 4/6: %sKudu table -- skipping data import "
                      "(use kudu_migrate.py for data)%s", _Y, _RST)
             result["actions"].append("skip_data(kudu)")
-        elif meta.is_partitioned:
-            log.info("Step 4/6: Loading data into target ...")
-            for i, part in enumerate(meta.partitions, 1):
-                part_path = os.path.join(meta.location, part)
-                log.info("  [%d/%d] Partition: %s", i, len(meta.partitions), part)
-                self.data_mover.import_from_efs(strategy, part_path,
-                                                database, table, partition=part)
-            result["actions"].append(f"import_data({len(meta.partitions)} partitions)")
         else:
             log.info("Step 4/6: Loading data into target ...")
+            log.info("  Target: %s", meta.location)
             self.data_mover.import_from_efs(strategy, meta.location, database, table)
             result["actions"].append("import_data")
 
