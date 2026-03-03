@@ -130,7 +130,7 @@ class ImpalaClient:
         cmd.extend(["-q", query, "--quiet"])
         log.debug("[%s] Running: %s", self.label, " ".join(cmd))
         log.debug("[%s] Query: %s", self.label, query[:200])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=600)
         if result.returncode != 0:
             stderr = result.stderr.strip()
             raise RuntimeError(
@@ -146,7 +146,7 @@ class ImpalaClient:
         if database:
             cmd.extend(["-d", database])
         cmd.extend(["-q", query, "--quiet", "-B", f"--output_delimiter={delimiter}"])
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(
                 f"impala-shell failed on {self.label}:\n"
@@ -184,6 +184,7 @@ class TableMeta:
         self.columns: List[Tuple[str, str]] = []
         self.grants: List[str] = []
         self.row_count: int = -1
+        self.is_kudu: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -192,6 +193,7 @@ class TableMeta:
             "create_ddl": self.create_ddl,
             "is_external": self.is_external,
             "is_partitioned": self.is_partitioned,
+            "is_kudu": self.is_kudu,
             "location": self.location,
             "file_format": self.file_format,
             "partition_columns": self.partition_columns,
@@ -216,6 +218,7 @@ class TableMeta:
         m.columns = [tuple(c) for c in d.get("columns", [])]
         m.grants = d.get("grants", [])
         m.row_count = d.get("row_count", -1)
+        m.is_kudu = d.get("is_kudu", False)
         return m
 
 
@@ -326,6 +329,8 @@ class MetadataExtractor:
         meta.file_format = desc.get("InputFormat", "")
         meta.columns = self.get_columns(database, table)
 
+        meta.is_kudu = "stored as kudu" in meta.create_ddl.lower()
+
         part_cols = []
         ddl_lower = meta.create_ddl.lower()
         if "partitioned by" in ddl_lower:
@@ -410,7 +415,7 @@ class DataMover:
         if self.dry_run:
             log.info("[DataMover] DRY-RUN -- skipped")
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=7200)
         if result.returncode != 0:
             raise RuntimeError(
                 f"DataMover command failed ({label}):\n"
@@ -590,6 +595,15 @@ class MigrationEngine:
         )
 
     @staticmethod
+    def _rewrite_kudu_masters(ddl: str, target_masters: str) -> str:
+        return re.sub(
+            r"('kudu\.master_addresses'\s*=\s*')[^']*(')",
+            rf"\g<1>{target_masters}\g<2>",
+            ddl,
+            flags=re.IGNORECASE,
+        )
+
+    @staticmethod
     def _make_if_not_exists(ddl: str) -> str:
         ddl = re.sub(
             r'CREATE\s+EXTERNAL\s+TABLE\b',
@@ -617,12 +631,13 @@ class MigrationEngine:
         # 1. Extract metadata
         log.info("Step 1/4: Extracting metadata from source ...")
         meta = extractor.get_table_meta(database, table)
+        table_type = "KUDU" if meta.is_kudu else ("EXTERNAL" if meta.is_external else "MANAGED")
         log.info("  Type: %s | Partitioned: %s | Format: %s",
-                 "EXTERNAL" if meta.is_external else "MANAGED",
-                 meta.is_partitioned, meta.file_format)
+                 table_type, meta.is_partitioned, meta.file_format)
         log.info("  Location: %s", meta.location)
         if meta.is_partitioned:
             log.info("  Partitions: %d", len(meta.partitions))
+        result["is_kudu"] = meta.is_kudu
         result["actions"].append("extract_metadata")
 
         # 2. Get row count
@@ -631,9 +646,13 @@ class MigrationEngine:
         log.info("  Row count: %d", meta.row_count)
         result["source_row_count"] = meta.row_count
 
-        # 3. Copy data to EFS
-        log.info("Step 3/4: Copying data to EFS staging ...")
-        if meta.is_partitioned:
+        # 3. Copy data to EFS (skipped for Kudu tables)
+        if meta.is_kudu:
+            log.info("Step 3/4: %sKudu table -- skipping data export "
+                     "(use kudu_migrate.py for data)%s", _Y, _RST)
+            result["actions"].append("skip_data(kudu)")
+        elif meta.is_partitioned:
+            log.info("Step 3/4: Copying data to EFS staging ...")
             for i, part in enumerate(meta.partitions, 1):
                 part_path = os.path.join(meta.location, part)
                 log.info("  [%d/%d] Partition: %s", i, len(meta.partitions), part)
@@ -641,6 +660,7 @@ class MigrationEngine:
                                               database, table, partition=part)
             result["actions"].append(f"export_data({len(meta.partitions)} partitions)")
         else:
+            log.info("Step 3/4: Copying data to EFS staging ...")
             self.data_mover.export_to_efs(strategy, meta.location, database, table)
             result["actions"].append("export_data")
 
@@ -714,7 +734,12 @@ class MigrationEngine:
 
         log.info("Step 3/6: Creating table on target ...")
         ddl = meta.create_ddl
-        if strategy == "efs-direct":
+        if meta.is_kudu:
+            target_kudu = self.cfg.get("TARGET_KUDU_MASTERS", "")
+            if target_kudu:
+                ddl = self._rewrite_kudu_masters(ddl, target_kudu)
+                result["actions"].append("rewrite_kudu_masters")
+        elif strategy == "efs-direct":
             efs_data = f"file://{self.data_mover.staging_data_path(database, table)}"
             ddl = self._rewrite_location(ddl, efs_data)
         if not force:
@@ -722,9 +747,13 @@ class MigrationEngine:
         self._exec_on_target(tgt, ddl)
         result["actions"].append("create_table")
 
-        # 4. Copy data from EFS to target HDFS
-        log.info("Step 4/6: Loading data into target ...")
-        if meta.is_partitioned:
+        # 4. Copy data from EFS to target HDFS (skipped for Kudu)
+        if meta.is_kudu:
+            log.info("Step 4/6: %sKudu table -- skipping data import "
+                     "(use kudu_migrate.py for data)%s", _Y, _RST)
+            result["actions"].append("skip_data(kudu)")
+        elif meta.is_partitioned:
+            log.info("Step 4/6: Loading data into target ...")
             for i, part in enumerate(meta.partitions, 1):
                 part_path = os.path.join(meta.location, part)
                 log.info("  [%d/%d] Partition: %s", i, len(meta.partitions), part)
@@ -732,25 +761,29 @@ class MigrationEngine:
                                                 database, table, partition=part)
             result["actions"].append(f"import_data({len(meta.partitions)} partitions)")
         else:
+            log.info("Step 4/6: Loading data into target ...")
             self.data_mover.import_from_efs(strategy, meta.location, database, table)
             result["actions"].append("import_data")
 
-        # 5. Recover partitions + compute stats
-        if meta.is_partitioned:
-            log.info("Step 5/6: Recovering partitions on target ...")
-            self._exec_on_target(
-                tgt, f"ALTER TABLE `{database}`.`{table}` RECOVER PARTITIONS"
-            )
-            result["actions"].append("recover_partitions")
-
-        log.info("Step 5/6: Computing stats on target ...")
-        if meta.is_partitioned:
-            self._exec_on_target(
-                tgt, f"COMPUTE INCREMENTAL STATS `{database}`.`{table}`"
-            )
+        # 5. Recover partitions + compute stats (skipped for Kudu)
+        if meta.is_kudu:
+            log.info("Step 5/6: Kudu manages its own storage -- skipping partition recovery and stats")
         else:
-            self._exec_on_target(tgt, f"COMPUTE STATS `{database}`.`{table}`")
-        result["actions"].append("compute_stats")
+            if meta.is_partitioned:
+                log.info("Step 5/6: Recovering partitions on target ...")
+                self._exec_on_target(
+                    tgt, f"ALTER TABLE `{database}`.`{table}` RECOVER PARTITIONS"
+                )
+                result["actions"].append("recover_partitions")
+
+            log.info("Step 5/6: Computing stats on target ...")
+            if meta.is_partitioned:
+                self._exec_on_target(
+                    tgt, f"COMPUTE INCREMENTAL STATS `{database}`.`{table}`"
+                )
+            else:
+                self._exec_on_target(tgt, f"COMPUTE STATS `{database}`.`{table}`")
+            result["actions"].append("compute_stats")
 
         # 6. Apply grants
         if meta.grants:
@@ -884,12 +917,18 @@ class MigrationEngine:
         tables = extractor.list_tables(database)
         info_list = []
         for t in tables:
-            desc = extractor.describe_formatted(database, t)
+            meta = extractor.get_table_meta(database, t)
+            if meta.is_kudu:
+                ttype = "KUDU"
+            elif meta.is_external:
+                ttype = "EXTERNAL"
+            else:
+                ttype = "MANAGED"
             info_list.append({
                 "table": t,
-                "type": "EXTERNAL" if desc.get("Table Type", "").upper().startswith("EXTERNAL") else "MANAGED",
-                "location": desc.get("Location", ""),
-                "format": desc.get("InputFormat", ""),
+                "type": ttype,
+                "location": meta.location,
+                "format": meta.file_format,
             })
         return info_list
 
@@ -970,13 +1009,13 @@ def preflight_checks(cfg: Config, need_source: bool = True,
     errors = []
 
     # Kerberos ticket
-    result = subprocess.run(["klist", "-s"], capture_output=True)
+    result = subprocess.run(["klist", "-s"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         if cfg.KRB_PRINCIPAL and cfg.KRB_KEYTAB:
             log.info("No active Kerberos ticket; performing kinit with keytab ...")
             kr = subprocess.run(
                 ["kinit", "-kt", cfg.KRB_KEYTAB, cfg.KRB_PRINCIPAL],
-                capture_output=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
             )
             if kr.returncode != 0:
                 errors.append(f"kinit failed: {kr.stderr.strip()}")
@@ -995,7 +1034,7 @@ def preflight_checks(cfg: Config, need_source: bool = True,
 
     # impala-shell
     result = subprocess.run([cfg.IMPALA_SHELL_BIN, "--version"],
-                            capture_output=True, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     if result.returncode != 0:
         errors.append(f"impala-shell not found at: {cfg.IMPALA_SHELL_BIN}")
 
