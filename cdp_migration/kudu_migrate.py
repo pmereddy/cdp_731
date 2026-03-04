@@ -130,15 +130,25 @@ class KuduClient:
             )
         return [t.strip() for t in stdout.splitlines() if t.strip()]
 
+    @staticmethod
+    def _strip_impala_prefix(table_name):
+        """Strip 'impala::' prefix if present (HMS-integrated targets don't use it)."""
+        if table_name.startswith("impala::"):
+            return table_name[len("impala::"):]
+        return table_name
+
     def copy_table(self, src_masters, src_table, dst_masters,
                    dst_table=None, predicates=None):
         """Copy a Kudu table between clusters."""
-        dst_table = dst_table or src_table
+        if dst_table is None:
+            dst_table = self._strip_impala_prefix(src_table)
         cmd = [
             self.kudu_bin, "table", "copy",
             src_masters, src_table,
-            dst_masters, dst_table,
+            dst_masters,
         ]
+        if dst_table != src_table:
+            cmd.append("-dst_table={}".format(dst_table))
         if predicates:
             cmd.extend(["--predicates={}".format(predicates)])
 
@@ -198,7 +208,7 @@ def preflight_checks(cfg):
             )
 
     rc = subprocess.run(
-        [cfg.KUDU_BIN, "--help"],
+        [cfg.KUDU_BIN, "--version"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).returncode
@@ -223,7 +233,7 @@ def preflight_checks(cfg):
 # ═══════════════════════════════════════════════════════════════════════════
 def cmd_copy_table(cfg, args, client):
     src_table = args.table
-    dst_table = args.dst_table or src_table
+    dst_table = args.dst_table or KuduClient._strip_impala_prefix(src_table)
     src_masters = cfg.SOURCE_KUDU_MASTERS
     dst_masters = cfg.TARGET_KUDU_MASTERS
 
@@ -275,9 +285,10 @@ def cmd_copy_db(cfg, args, client):
 
     log.info("Found %d Kudu tables for %s", len(matched), database)
     for i, tbl in enumerate(matched, 1):
-        log.info("\n[%d/%d] %s", i, len(matched), tbl)
+        dst_tbl = KuduClient._strip_impala_prefix(tbl)
+        log.info("\n[%d/%d] %s -> %s", i, len(matched), tbl, dst_tbl)
         try:
-            output = client.copy_table(src_masters, tbl, dst_masters, tbl)
+            output = client.copy_table(src_masters, tbl, dst_masters, dst_tbl)
             if output:
                 log.info("  %s", output)
             log.info("  %sOK%s", _G, _RST)
@@ -314,8 +325,9 @@ def cmd_verify(cfg, args, client):
 
     for tbl in tables:
         try:
+            dst_tbl = KuduClient._strip_impala_prefix(tbl)
             src_count = client.row_count(src_masters, tbl)
-            tgt_count = client.row_count(dst_masters, tbl)
+            tgt_count = client.row_count(dst_masters, dst_tbl)
             match = src_count == tgt_count
             status = "{}OK{}".format(_G, _RST) if match else "{}FAIL{}".format(_R, _RST)
             print("  {:<45} {:>12} {:>12} {:>18}".format(
