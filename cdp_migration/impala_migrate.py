@@ -185,6 +185,7 @@ class TableMeta:
         self.grants: List[str] = []
         self.row_count: int = -1
         self.is_kudu: bool = False
+        self.is_view: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -194,6 +195,7 @@ class TableMeta:
             "is_external": self.is_external,
             "is_partitioned": self.is_partitioned,
             "is_kudu": self.is_kudu,
+            "is_view": self.is_view,
             "location": self.location,
             "file_format": self.file_format,
             "partition_columns": self.partition_columns,
@@ -219,6 +221,7 @@ class TableMeta:
         m.grants = d.get("grants", [])
         m.row_count = d.get("row_count", -1)
         m.is_kudu = d.get("is_kudu", False)
+        m.is_view = d.get("is_view", False)
         return m
 
 
@@ -343,7 +346,9 @@ class MetadataExtractor:
         meta.table = table
         meta.create_ddl = self.get_create_ddl(database, table)
         desc = self.describe_formatted(database, table)
-        meta.is_external = desc.get("Table Type", "").upper().startswith("EXTERNAL")
+        table_type_str = desc.get("Table Type", "").upper()
+        meta.is_external = table_type_str.startswith("EXTERNAL")
+        meta.is_view = "VIEW" in table_type_str or not desc.get("Location", "")
         meta.location = desc.get("Location", "")
         meta.file_format = desc.get("InputFormat", "")
         meta.columns = self.get_columns(database, table)
@@ -603,8 +608,29 @@ class MigrationEngine:
             self.cfg.TARGET_IMPALA_PORT, "TARGET",
         )
 
+    @staticmethod
+    def _clean_impala_output(text: str) -> str:
+        """Strip impala-shell box-drawing borders and column headers."""
+        lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("+") and stripped.endswith("+"):
+                continue
+            if stripped.startswith("|"):
+                cleaned = stripped.strip("|").strip()
+                if cleaned and cleaned.lower() != "result":
+                    lines.append(cleaned)
+            elif stripped.lower() == "result":
+                continue
+            else:
+                lines.append(stripped)
+        return "\n".join(lines)
+
     def _exec_on_target(self, tgt: ImpalaClient, query: str,
                         database: Optional[str] = None):
+        query = self._clean_impala_output(query)
         if self.dry_run:
             log.info("[DRY-RUN] Would execute on TARGET: %s", query[:300])
             return ""
@@ -618,6 +644,14 @@ class MigrationEngine:
             ddl,
             flags=re.IGNORECASE,
         )
+
+    def _remap_hdfs_path(self, path: str) -> str:
+        """Replace SOURCE_HDFS_BASE prefix with TARGET_HDFS_BASE in a path."""
+        src_base = self.cfg.get("SOURCE_HDFS_BASE", "").rstrip("/")
+        tgt_base = self.cfg.get("TARGET_HDFS_BASE", "").rstrip("/")
+        if src_base and tgt_base and path.startswith(src_base):
+            return tgt_base + path[len(src_base):]
+        return path
 
     @staticmethod
     def _rewrite_kudu_masters(ddl: str, target_masters: str) -> str:
@@ -640,7 +674,22 @@ class MigrationEngine:
             'CREATE TABLE IF NOT EXISTS',
             ddl, count=1, flags=re.IGNORECASE,
         )
+        ddl = re.sub(
+            r'CREATE\s+VIEW\b(?!\s+IF)',
+            'CREATE VIEW IF NOT EXISTS',
+            ddl, count=1, flags=re.IGNORECASE,
+        )
         return ddl
+
+    @staticmethod
+    def _strip_location(ddl: str) -> str:
+        """Remove the LOCATION clause from a DDL statement."""
+        return re.sub(
+            r"\n?\s*LOCATION\s+'[^']*'",
+            "",
+            ddl,
+            flags=re.IGNORECASE,
+        )
 
     # ── EXPORT ────────────────────────────────────────────────────────────
     def export_table(self, database: str, table: str,
@@ -656,23 +705,39 @@ class MigrationEngine:
         # 1. Extract metadata
         log.info("Step 1/4: Extracting metadata from source ...")
         meta = extractor.get_table_meta(database, table)
-        table_type = "KUDU" if meta.is_kudu else ("EXTERNAL" if meta.is_external else "MANAGED")
+        if meta.is_view:
+            table_type = "VIEW"
+        elif meta.is_kudu:
+            table_type = "KUDU"
+        elif meta.is_external:
+            table_type = "EXTERNAL"
+        else:
+            table_type = "MANAGED"
         log.info("  Type: %s | Partitioned: %s | Format: %s",
                  table_type, meta.is_partitioned, meta.file_format)
         log.info("  Location: %s", meta.location)
         if meta.is_partitioned:
             log.info("  Partitions: %d", len(meta.partitions))
         result["is_kudu"] = meta.is_kudu
+        result["is_view"] = meta.is_view
         result["actions"].append("extract_metadata")
 
-        # 2. Get row count
-        log.info("Step 2/4: Getting source row count ...")
-        meta.row_count = extractor.get_row_count(database, table)
-        log.info("  Row count: %d", meta.row_count)
+        # 2. Get row count (skipped for views)
+        if meta.is_view:
+            log.info("Step 2/4: %sView -- skipping row count%s", _Y, _RST)
+            meta.row_count = -1
+        else:
+            log.info("Step 2/4: Getting source row count ...")
+            meta.row_count = extractor.get_row_count(database, table)
+            log.info("  Row count: %d", meta.row_count)
         result["source_row_count"] = meta.row_count
 
-        # 3. Copy data to EFS (skipped for Kudu tables)
-        if meta.is_kudu:
+        # 3. Copy data to EFS (skipped for views and Kudu tables)
+        if meta.is_view:
+            log.info("Step 3/4: %sView -- DDL only, skipping data export%s",
+                     _Y, _RST)
+            result["actions"].append("skip_data(view)")
+        elif meta.is_kudu:
             log.info("Step 3/4: %sKudu table -- skipping data export "
                      "(use kudu_migrate.py for data)%s", _Y, _RST)
             result["actions"].append("skip_data(kudu)")
@@ -747,40 +812,93 @@ class MigrationEngine:
         self._exec_on_target(tgt, f"CREATE DATABASE IF NOT EXISTS `{database}`")
         result["actions"].append("create_database")
 
-        # 3. Handle force / create table
+        # 3. Handle force / create table or view
         if force:
-            log.info("Step 3/6: --force: dropping target table if exists ...")
-            self._exec_on_target(tgt, f"DROP TABLE IF EXISTS `{database}`.`{table}`")
+            log.info("Step 3/6: --force: dropping target object if exists ...")
+            if meta.is_view:
+                self._exec_on_target(tgt, f"DROP VIEW IF EXISTS `{database}`.`{table}`")
+            else:
+                self._exec_on_target(tgt, f"DROP TABLE IF EXISTS `{database}`.`{table}`")
             result["actions"].append("drop_existing")
 
-        log.info("Step 3/6: Creating table on target ...")
+        # Remap HDFS location if SOURCE/TARGET base paths are configured
+        target_location = self._remap_hdfs_path(meta.location) if meta.location else ""
+        if target_location and target_location != meta.location:
+            log.info("  HDFS location remapped: %s -> %s", meta.location, target_location)
+
+        # For managed (non-external) tables, strip LOCATION so the Hive
+        # Metastore assigns the default managed warehouse path.  The actual
+        # assigned path is discovered after CREATE TABLE for the data copy.
+        strip_managed_location = (
+            not meta.is_view
+            and not meta.is_kudu
+            and not meta.is_external
+            and meta.location
+        )
+
+        log.info("Step 3/6: Creating %s on target ...",
+                 "view" if meta.is_view else "table")
         ddl = meta.create_ddl
-        if meta.is_kudu:
-            target_kudu = self.cfg.get("TARGET_KUDU_MASTERS", "")
-            if target_kudu:
-                ddl = self._rewrite_kudu_masters(ddl, target_kudu)
-                result["actions"].append("rewrite_kudu_masters")
-        elif strategy == "efs-direct":
-            efs_data = f"file://{self.data_mover.staging_data_path(database, table)}"
-            ddl = self._rewrite_location(ddl, efs_data)
+        if not meta.is_view:
+            if meta.is_kudu:
+                target_kudu = self.cfg.get("TARGET_KUDU_MASTERS", "")
+                if target_kudu:
+                    ddl = self._rewrite_kudu_masters(ddl, target_kudu)
+                    result["actions"].append("rewrite_kudu_masters")
+            elif strip_managed_location:
+                log.info("  Managed table: stripping LOCATION (HMS will assign default)")
+                ddl = self._strip_location(ddl)
+                result["actions"].append("strip_managed_location")
+            elif strategy == "efs-direct":
+                efs_data = f"file://{self.data_mover.staging_data_path(database, table)}"
+                ddl = self._rewrite_location(ddl, efs_data)
+            else:
+                if target_location and target_location != meta.location:
+                    ddl = self._rewrite_location(ddl, target_location)
+                    result["actions"].append("remap_location")
         if not force:
             ddl = self._make_if_not_exists(ddl)
-        self._exec_on_target(tgt, ddl)
-        result["actions"].append("create_table")
 
-        # 4. Copy data from EFS to target HDFS (skipped for Kudu)
-        if meta.is_kudu:
+        has_hdfs_data = not meta.is_view and not meta.is_kudu and strategy != "efs-direct"
+        if has_hdfs_data and not strip_managed_location and target_location:
+            log.info("  Pre-creating HDFS directory: %s", target_location)
+            try:
+                self.data_mover._run(
+                    [self.cfg.HDFS_BIN, "dfs", "-mkdir", "-p", target_location],
+                    "mkdir target HDFS dir",
+                )
+            except RuntimeError as e:
+                log.warning("Could not pre-create HDFS dir (may need admin): %s", e)
+
+        self._exec_on_target(tgt, ddl)
+        result["actions"].append("create_view" if meta.is_view else "create_table")
+
+        # For managed tables whose LOCATION was stripped, discover the
+        # actual path assigned by the Hive Metastore on the target.
+        if strip_managed_location:
+            tgt_extractor = MetadataExtractor(tgt)
+            tgt_desc = tgt_extractor.describe_formatted(database, table)
+            target_location = tgt_desc.get("Location", "")
+            log.info("  Managed table assigned location: %s", target_location)
+
+        # 4. Copy data from EFS to target HDFS (skipped for views and Kudu)
+        if meta.is_view:
+            log.info("Step 4/6: %sView -- no data to import%s", _Y, _RST)
+            result["actions"].append("skip_data(view)")
+        elif meta.is_kudu:
             log.info("Step 4/6: %sKudu table -- skipping data import "
                      "(use kudu_migrate.py for data)%s", _Y, _RST)
             result["actions"].append("skip_data(kudu)")
         else:
             log.info("Step 4/6: Loading data into target ...")
-            log.info("  Target: %s", meta.location)
-            self.data_mover.import_from_efs(strategy, meta.location, database, table)
+            log.info("  Target: %s", target_location)
+            self.data_mover.import_from_efs(strategy, target_location, database, table)
             result["actions"].append("import_data")
 
-        # 5. Recover partitions + compute stats (skipped for Kudu)
-        if meta.is_kudu:
+        # 5. Recover partitions + compute stats (skipped for views and Kudu)
+        if meta.is_view:
+            log.info("Step 5/6: View -- skipping partitions and stats")
+        elif meta.is_kudu:
             log.info("Step 5/6: Kudu manages its own storage -- skipping partition recovery and stats")
         else:
             if meta.is_partitioned:
@@ -932,7 +1050,9 @@ class MigrationEngine:
         info_list = []
         for t in tables:
             meta = extractor.get_table_meta(database, t)
-            if meta.is_kudu:
+            if meta.is_view:
+                ttype = "VIEW"
+            elif meta.is_kudu:
                 ttype = "KUDU"
             elif meta.is_external:
                 ttype = "EXTERNAL"
