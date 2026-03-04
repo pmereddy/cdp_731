@@ -508,8 +508,12 @@ class DataMover:
             ]
             self._run(cmd, f"distcp EFS->HDFS {database}.{table}")
         elif strategy == "hdfs-cp":
-            cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f",
-                   src + "/.", hdfs_dest.rstrip("/")]
+            import glob
+            entries = glob.glob(os.path.join(src, "*"))
+            if not entries:
+                log.warning("No files found in staging dir: %s", src)
+                return
+            cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f"] + entries + [hdfs_dest.rstrip("/")]
             self._run(cmd, f"hdfs-put EFS->HDFS {database}.{table}")
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -809,8 +813,26 @@ class MigrationEngine:
 
         # 2. Create database
         log.info("Step 2/6: Creating database on target ...")
-        self._exec_on_target(tgt, f"CREATE DATABASE IF NOT EXISTS `{database}`")
-        result["actions"].append("create_database")
+        try:
+            self._exec_on_target(tgt, f"CREATE DATABASE IF NOT EXISTS `{database}`")
+            result["actions"].append("create_database")
+        except RuntimeError as e:
+            # Database creation can fail when HMS tries to create HDFS dirs
+            # for a custom LOCATION.  Check if the database already exists.
+            try:
+                existing = tgt.execute(f"SHOW DATABASES LIKE '{database}'")
+                if database.lower() in existing.lower():
+                    log.warning("CREATE DATABASE failed but database already "
+                                "exists -- continuing: %s", e)
+                    result["actions"].append("create_database(exists)")
+                else:
+                    raise
+            except RuntimeError:
+                raise RuntimeError(
+                    f"Cannot create database '{database}' on target. "
+                    f"You may need to pre-create it manually or ensure "
+                    f"the HDFS directory exists. Original error: {e}"
+                )
 
         # 3. Handle force / create table or view
         if force:
