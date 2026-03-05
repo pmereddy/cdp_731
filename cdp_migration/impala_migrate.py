@@ -508,13 +508,22 @@ class DataMover:
             ]
             self._run(cmd, f"distcp EFS->HDFS {database}.{table}")
         elif strategy == "hdfs-cp":
-            import glob
-            entries = glob.glob(os.path.join(src, "*"))
+            if not os.path.isdir(src):
+                log.warning("No staging data dir found: %s", src)
+                return
+            entries = [os.path.join(src, e) for e in os.listdir(src)]
             if not entries:
                 log.warning("No files found in staging dir: %s", src)
                 return
-            cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f"] + entries + [hdfs_dest.rstrip("/")]
-            self._run(cmd, f"hdfs-put EFS->HDFS {database}.{table}")
+            batch_size = 50
+            dest = hdfs_dest.rstrip("/")
+            for i in range(0, len(entries), batch_size):
+                batch = entries[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                total_batches = (len(entries) + batch_size - 1) // batch_size
+                cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f"] + batch + [dest]
+                self._run(cmd, "hdfs-put EFS->HDFS {}.{} (batch {}/{})".format(
+                    database, table, batch_num, total_batches))
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
