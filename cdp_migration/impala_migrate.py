@@ -436,6 +436,12 @@ class DataMover:
         self.dry_run = dry_run
         self.efs_staging = cfg.EFS_STAGING_DIR
 
+    @staticmethod
+    def _shell_quote(path: str) -> str:
+        """Shell-quote a path for safe use in shell=True commands."""
+        import shlex
+        return shlex.quote(path)
+
     def _run(self, cmd: List[str], label: str = "") -> subprocess.CompletedProcess:
         log.info("[DataMover] %s: %s", label, " ".join(cmd))
         if self.dry_run:
@@ -511,19 +517,35 @@ class DataMover:
             if not os.path.isdir(src):
                 log.warning("No staging data dir found: %s", src)
                 return
-            entries = [os.path.join(src, e) for e in os.listdir(src)]
+            entries = sorted(os.listdir(src))
             if not entries:
                 log.warning("No files found in staging dir: %s", src)
                 return
-            batch_size = 50
             dest = hdfs_dest.rstrip("/")
-            for i in range(0, len(entries), batch_size):
-                batch = entries[i:i + batch_size]
-                batch_num = i // batch_size + 1
-                total_batches = (len(entries) + batch_size - 1) // batch_size
-                cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f"] + batch + [dest]
-                self._run(cmd, "hdfs-put EFS->HDFS {}.{} (batch {}/{})".format(
-                    database, table, batch_num, total_batches))
+            total = len(entries)
+            log.info("  Uploading %d entries to %s", total, dest)
+            for idx, entry in enumerate(entries, 1):
+                entry_path = os.path.join(src, entry)
+                cmd = '{} dfs -put -f {} {}'.format(
+                    self.cfg.HDFS_BIN,
+                    self._shell_quote(entry_path),
+                    self._shell_quote(dest),
+                )
+                if idx == 1 or idx == total or idx % 100 == 0:
+                    log.info("  [%d/%d] %s", idx, total, entry)
+                result = subprocess.run(
+                    cmd, shell=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    universal_newlines=True, timeout=7200,
+                )
+                if result.returncode != 0:
+                    log.error("  FAILED [%d/%d] %s: %s",
+                              idx, total, entry, result.stderr.strip())
+                    raise RuntimeError(
+                        f"DataMover command failed (hdfs-put {database}.{table}):\n"
+                        f"  entry : {entry}\n"
+                        f"  stderr: {result.stderr.strip()}"
+                    )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
