@@ -661,10 +661,24 @@ class MigrationEngine:
                 lines.append(stripped)
         return "\n".join(lines)
 
+    @staticmethod
+    def _strip_kudu_table_name(ddl: str) -> str:
+        """Remove 'kudu.table_name' property (auto-managed on HMS-synced targets)."""
+        cleaned = re.sub(
+            r",?\s*'kudu\.table_name'\s*=\s*'[^']*'",
+            "",
+            ddl,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r',\s*\)', ')', cleaned)
+        cleaned = re.sub(r'\(\s*,', '(', cleaned)
+        return cleaned
+
     def _exec_on_target(self, tgt: ImpalaClient, query: str,
                         database: Optional[str] = None):
         query = self._clean_impala_output(query)
         query = self._remove_long_properties(query)
+        query = self._strip_kudu_table_name(query)
         if self.dry_run:
             log.info("[DRY-RUN] Would execute on TARGET: %s", query[:300])
             return ""
