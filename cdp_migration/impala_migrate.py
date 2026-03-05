@@ -635,6 +635,7 @@ class MigrationEngine:
     def _exec_on_target(self, tgt: ImpalaClient, query: str,
                         database: Optional[str] = None):
         query = self._clean_impala_output(query)
+        query = self._truncate_long_properties(query)
         if self.dry_run:
             log.info("[DRY-RUN] Would execute on TARGET: %s", query[:300])
             return ""
@@ -693,6 +694,23 @@ class MigrationEngine:
             "",
             ddl,
             flags=re.IGNORECASE,
+        )
+
+    @staticmethod
+    def _truncate_long_properties(ddl: str, max_len: int = 4000) -> str:
+        """Truncate or remove property values that exceed Impala's limit."""
+        def _truncate_match(m):
+            key = m.group(1)
+            val = m.group(2)
+            if len(val) <= max_len:
+                return m.group(0)
+            log.warning("Truncating property '%s' from %d to %d chars",
+                        key, len(val), max_len)
+            return "'{}'='{}'".format(key, val[:max_len])
+        return re.sub(
+            r"'([^']+)'\s*=\s*'((?:[^'\\]|\\.)*)'",
+            _truncate_match,
+            ddl,
         )
 
     # ── EXPORT ────────────────────────────────────────────────────────────
