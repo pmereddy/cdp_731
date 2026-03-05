@@ -635,7 +635,7 @@ class MigrationEngine:
     def _exec_on_target(self, tgt: ImpalaClient, query: str,
                         database: Optional[str] = None):
         query = self._clean_impala_output(query)
-        query = self._truncate_long_properties(query)
+        query = self._remove_long_properties(query)
         if self.dry_run:
             log.info("[DRY-RUN] Would execute on TARGET: %s", query[:300])
             return ""
@@ -697,21 +697,24 @@ class MigrationEngine:
         )
 
     @staticmethod
-    def _truncate_long_properties(ddl: str, max_len: int = 4000) -> str:
-        """Truncate or remove property values that exceed Impala's limit."""
-        def _truncate_match(m):
+    def _remove_long_properties(ddl: str, max_len: int = 4000) -> str:
+        """Remove property key-value pairs whose value exceeds Impala's limit."""
+        def _check_match(m):
             key = m.group(1)
             val = m.group(2)
             if len(val) <= max_len:
                 return m.group(0)
-            log.warning("Truncating property '%s' from %d to %d chars",
+            log.warning("Removing oversized property '%s' (%d chars > %d limit)",
                         key, len(val), max_len)
-            return "'{}'='{}'".format(key, val[:max_len])
-        return re.sub(
-            r"'([^']+)'\s*=\s*'((?:[^'\\]|\\.)*)'",
-            _truncate_match,
+            return ""
+        ddl = re.sub(
+            r",?\s*'([^']+)'\s*=\s*'((?:[^'\\]|\\.)*)'",
+            _check_match,
             ddl,
         )
+        ddl = re.sub(r',\s*\)', ')', ddl)
+        ddl = re.sub(r'\(\s*,', '(', ddl)
+        return ddl
 
     # ── EXPORT ────────────────────────────────────────────────────────────
     def export_table(self, database: str, table: str,
