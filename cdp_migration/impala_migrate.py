@@ -526,15 +526,13 @@ class DataMover:
             log.info("  Uploading %d entries to %s", total, dest)
             for idx, entry in enumerate(entries, 1):
                 entry_path = os.path.join(src, entry)
-                cmd = '{} dfs -put -f {} {}'.format(
-                    self.cfg.HDFS_BIN,
-                    self._shell_quote(entry_path),
-                    self._shell_quote(dest),
-                )
+                file_uri = "file://" + entry_path
+                cmd = [self.cfg.HDFS_BIN, "dfs", "-put", "-f",
+                       file_uri, dest + "/"]
                 if idx == 1 or idx == total or idx % 100 == 0:
                     log.info("  [%d/%d] %s", idx, total, entry)
                 result = subprocess.run(
-                    cmd, shell=True,
+                    cmd,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     universal_newlines=True, timeout=7200,
                 )
