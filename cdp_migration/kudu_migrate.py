@@ -132,16 +132,36 @@ class KuduClient:
 
     @staticmethod
     def _strip_impala_prefix(table_name):
-        """Strip 'impala::' prefix if present (HMS-integrated targets don't use it)."""
+        """Strip 'impala::' prefix if present."""
         if table_name.startswith("impala::"):
             return table_name[len("impala::"):]
         return table_name
 
     def copy_table(self, src_masters, src_table, dst_masters,
-                   dst_table=None, predicates=None):
-        """Copy a Kudu table between clusters."""
+                   dst_table=None, predicates=None, check_dst_exists=True):
+        """Copy a Kudu table between clusters.
+        Default dst_table strips 'impala::' from src_table.
+        If check_dst_exists is True, verifies the destination table exists on target
+        before copying (avoids opaque 'partitioning must be specified' errors).
+        """
         if dst_table is None:
             dst_table = self._strip_impala_prefix(src_table)
+        if check_dst_exists and not self.dry_run:
+            existing = set(self.list_tables(dst_masters))
+            alt = dst_table if dst_table.startswith("impala::") else "impala::" + dst_table
+            if dst_table in existing:
+                pass  # use dst_table as-is
+            elif alt in existing:
+                dst_table = alt  # target uses impala:: prefix
+            else:
+                raise RuntimeError(
+                    "Destination table '{}' (or '{}') not found on target Kudu cluster.\n"
+                    "Create the table on the target first with:\n"
+                    "  impala_migrate.py import-table -d <database> -t <table>\n"
+                    "Then run this copy again. (The 'Table partitioning must be specified' "
+                    "error from the Kudu CLI usually means the destination table did not exist.)"
+                    .format(dst_table, alt)
+                )
         cmd = [
             self.kudu_bin, "table", "copy",
             src_masters, src_table,
@@ -249,6 +269,7 @@ def cmd_copy_table(cfg, args, client):
     output = client.copy_table(
         src_masters, src_table, dst_masters, dst_table,
         predicates=args.predicates,
+        check_dst_exists=not getattr(args, "no_check_dst", False),
     )
     if output:
         log.info("  kudu output: %s", output)
@@ -288,7 +309,7 @@ def cmd_copy_db(cfg, args, client):
         dst_tbl = KuduClient._strip_impala_prefix(tbl)
         log.info("\n[%d/%d] %s -> %s", i, len(matched), tbl, dst_tbl)
         try:
-            output = client.copy_table(src_masters, tbl, dst_masters, dst_tbl)
+            output = client.copy_table(src_masters, tbl, dst_masters, dst_table=dst_tbl)
             if output:
                 log.info("  %s", output)
             log.info("  %sOK%s", _G, _RST)
@@ -403,7 +424,9 @@ def build_parser():
     ct.add_argument("--table", "-t", required=True,
                     help="Kudu table name (e.g. impala::db.table)")
     ct.add_argument("--dst-table", default=None,
-                    help="Target table name (default: same as source)")
+                    help="Target table name (default: source without impala:: prefix)")
+    ct.add_argument("--no-check-dst", action="store_true",
+                    help="Skip checking that destination table exists (use with --dst-table if name differs)")
     ct.add_argument("--predicates", default=None,
                     help="JSON predicates for partial copy")
     ct.add_argument("--verify-after", action="store_true",
