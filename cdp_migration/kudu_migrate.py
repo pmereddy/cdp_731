@@ -63,6 +63,13 @@ class Config:
         "KUDU_BIN": "kudu",
         "KRB_PRINCIPAL": "",
         "KRB_KEYTAB": "",
+        "SOURCE_IMPALA_HOST": "",
+        "SOURCE_IMPALA_PORT": "21050",
+        "TARGET_IMPALA_HOST": "",
+        "TARGET_IMPALA_PORT": "21050",
+        "IMPALA_SHELL_BIN": "impala-shell",
+        "IMPALA_SHELL_EXTRA_OPTS": "",
+        "EFS_STAGING_DIR": "/mnt/efs/shared/impala_migrate_staging",
     }
 
     def __init__(self, env_path, cli_overrides=None):
@@ -153,6 +160,8 @@ class KuduClient:
                 pass  # use dst_table as-is
             elif alt in existing:
                 dst_table = alt  # target uses impala:: prefix
+            elif src_table in existing:
+                dst_table = src_table  # target has same name as source; omit -dst_table
             else:
                 raise RuntimeError(
                     "Destination table '{}' (or '{}') not found on target Kudu cluster.\n"
@@ -162,6 +171,7 @@ class KuduClient:
                     "error from the Kudu CLI usually means the destination table did not exist.)"
                     .format(dst_table, alt)
                 )
+            log.info("Using destination table name on target: %s", dst_table)
         cmd = [
             self.kudu_bin, "table", "copy",
             src_masters, src_table,
@@ -200,9 +210,146 @@ class KuduClient:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Impala-based copy (fallback when kudu table copy fails with partition error)
+# ═══════════════════════════════════════════════════════════════════════════
+def _parse_impala_table(name):
+    """Return (database, table) from 'impala::db.t' or 'db.t'."""
+    n = name[len("impala::"):] if name.startswith("impala::") else name
+    if "." not in n:
+        raise ValueError("Table name must be database.table or impala::database.table")
+    db, tbl = n.split(".", 1)
+    return db.strip(), tbl.strip()
+
+
+def _impala_run(cfg, host, port, database, query, label="Impala"):
+    """Run a single query via impala-shell; return stdout. Raises on failure."""
+    cmd = [cfg.get("IMPALA_SHELL_BIN", "impala-shell"), "-k", "-i", "{}:{}".format(host, port),
+           "-d", database, "-q", query, "--quiet"]
+    extra = (cfg.get("IMPALA_SHELL_EXTRA_OPTS") or "").strip()
+    if extra:
+        cmd.extend(extra.split())
+    log.info("[%s] %s", label, query[:120] + "..." if len(query) > 120 else query)
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=3600,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "impala-shell failed ({}): {}".format(label, result.stderr.strip())
+        )
+    return result.stdout.strip()
+
+
+def _impala_run_delimited(cfg, host, port, database, query, label="Impala"):
+    """Run query with -B tab output; return list of rows (list of columns)."""
+    cmd = [cfg.get("IMPALA_SHELL_BIN", "impala-shell"), "-k", "-i", "{}:{}".format(host, port),
+           "-d", database, "-q", query, "--quiet", "-B", "--output_delimiter=\t"]
+    extra = (cfg.get("IMPALA_SHELL_EXTRA_OPTS") or "").strip()
+    if extra:
+        cmd.extend(extra.split())
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "impala-shell failed ({}): {}".format(label, result.stderr.strip())
+        )
+    rows = []
+    for line in result.stdout.strip().splitlines():
+        if line.strip():
+            rows.append([c.strip() for c in line.split("\t")])
+    return rows
+
+
+def _get_kudu_columns(cfg, database, table):
+    """Return list of (name, type) for the table (from DESCRIBE)."""
+    rows = _impala_run_delimited(
+        cfg,
+        cfg.SOURCE_IMPALA_HOST,
+        cfg.SOURCE_IMPALA_PORT,
+        database,
+        "DESCRIBE `{}`".format(table),
+        "SOURCE",
+    )
+    # DESCRIBE: name, type, comment; skip partition row if present
+    cols = []
+    for row in rows:
+        if len(row) >= 2 and row[0] and not row[0].startswith("#"):
+            name, typ = row[0], row[1]
+            if name.upper() in ("PARTITION", "PARTITIONED BY"):
+                break
+            cols.append((name, typ))
+    return cols
+
+
+def copy_table_via_impala(cfg, database, table, dry_run=False):
+    """
+    Copy Kudu table data from source to target using Parquet staging on EFS.
+    Use when 'kudu table copy' fails with 'Table partitioning must be specified'.
+    """
+    efs_base = (cfg.get("EFS_STAGING_DIR") or "").rstrip("/")
+    if not efs_base:
+        raise RuntimeError("EFS_STAGING_DIR is not set; required for copy-table-impala")
+    if not cfg.get("SOURCE_IMPALA_HOST") or not cfg.get("TARGET_IMPALA_HOST"):
+        raise RuntimeError("SOURCE_IMPALA_HOST and TARGET_IMPALA_HOST must be set for copy-table-impala")
+
+    staging_table = "_kudu_staging_{}".format(table)
+    # Use file:// so Impala writes to the EFS mount (local path on each node)
+    staging_location = "file://{}/kudu_copy/{}/{}".format(efs_base, database, table)
+
+    if dry_run:
+        log.info("[DRY-RUN] Would copy %s.%s via Parquet staging at %s", database, table, staging_location)
+        return
+
+    cols = _get_kudu_columns(cfg, database, table)
+    col_defs = ", ".join("`{}` {}".format(c[0], c[1]) for c in cols)
+    create_parquet = (
+        "CREATE EXTERNAL TABLE `{}`.`{}` ({}) "
+        "STORED AS PARQUET LOCATION '{}'"
+    ).format(database, staging_table, col_defs, staging_location)
+
+    log.info("Step 1/5: Create Parquet staging table on source and export from Kudu ...")
+    _impala_run(cfg, cfg.SOURCE_IMPALA_HOST, cfg.SOURCE_IMPALA_PORT, database,
+                "DROP TABLE IF EXISTS `{}`.`{}`".format(database, staging_table), "SOURCE")
+    _impala_run(cfg, cfg.SOURCE_IMPALA_HOST, cfg.SOURCE_IMPALA_PORT, database,
+                create_parquet, "SOURCE")
+    _impala_run(cfg, cfg.SOURCE_IMPALA_HOST, cfg.SOURCE_IMPALA_PORT, database,
+                "INSERT INTO `{}`.`{}` SELECT * FROM `{}`.`{}`".format(
+                    database, staging_table, database, table),
+                "SOURCE")
+
+    log.info("Step 2/5: Create external table on target pointing to same EFS path ...")
+    _impala_run(cfg, cfg.TARGET_IMPALA_HOST, cfg.TARGET_IMPALA_PORT, database,
+                "DROP TABLE IF EXISTS `{}`.`{}`".format(database, staging_table), "TARGET")
+    _impala_run(cfg, cfg.TARGET_IMPALA_HOST, cfg.TARGET_IMPALA_PORT, database,
+                create_parquet, "TARGET")
+
+    log.info("Step 3/5: INSERT INTO Kudu table on target from Parquet ...")
+    _impala_run(cfg, cfg.TARGET_IMPALA_HOST, cfg.TARGET_IMPALA_PORT, database,
+                "INSERT INTO `{}`.`{}` SELECT * FROM `{}`.`{}`".format(
+                    database, table, database, staging_table),
+                "TARGET")
+
+    log.info("Step 4/5: Drop staging tables ...")
+    _impala_run(cfg, cfg.SOURCE_IMPALA_HOST, cfg.SOURCE_IMPALA_PORT, database,
+                "DROP TABLE IF EXISTS `{}`.`{}`".format(database, staging_table), "SOURCE")
+    _impala_run(cfg, cfg.TARGET_IMPALA_HOST, cfg.TARGET_IMPALA_PORT, database,
+                "DROP TABLE IF EXISTS `{}`.`{}`".format(database, staging_table), "TARGET")
+
+    log.info("Step 5/5: Done.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Pre-flight
 # ═══════════════════════════════════════════════════════════════════════════
-def preflight_checks(cfg):
+def preflight_checks(cfg, require_kudu=True):
     errors = []
 
     result = subprocess.run(
@@ -227,18 +374,20 @@ def preflight_checks(cfg):
                 "or set KRB_PRINCIPAL/KRB_KEYTAB in .env"
             )
 
-    rc = subprocess.run(
-        [cfg.KUDU_BIN, "--version"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).returncode
-    if rc != 0:
-        errors.append("kudu CLI not found at: {}".format(cfg.KUDU_BIN))
+    if require_kudu:
+        rc = subprocess.run(
+            [cfg.KUDU_BIN, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).returncode
+        if rc != 0:
+            errors.append("kudu CLI not found at: {}".format(cfg.KUDU_BIN))
 
-    if not cfg.SOURCE_KUDU_MASTERS:
-        errors.append("SOURCE_KUDU_MASTERS is not set")
-    if not cfg.TARGET_KUDU_MASTERS:
-        errors.append("TARGET_KUDU_MASTERS is not set")
+    if require_kudu:
+        if not cfg.SOURCE_KUDU_MASTERS:
+            errors.append("SOURCE_KUDU_MASTERS is not set")
+        if not cfg.TARGET_KUDU_MASTERS:
+            errors.append("TARGET_KUDU_MASTERS is not set")
 
     if errors:
         for e in errors:
@@ -404,20 +553,19 @@ def build_parser():
           kudu_migrate.py list-tables -d sales
         """),
     )
-
+    p.add_argument("--env", default=None, help="Path to impala_migrate.env")
+    p.add_argument("--source-masters", default=None, help="Override SOURCE_KUDU_MASTERS")
+    p.add_argument("--target-masters", default=None, help="Override TARGET_KUDU_MASTERS")
+    p.add_argument("--dry-run", action="store_true", help="Do not run copy commands")
+    p.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--env", default=None,
-                        help="Path to impala_migrate.env")
-    common.add_argument("--source-masters", default=None,
-                        help="Source Kudu masters (overrides env)")
-    common.add_argument("--target-masters", default=None,
-                        help="Target Kudu masters (overrides env)")
-    common.add_argument("--log-level", default="INFO",
-                        choices=["DEBUG", "INFO", "WARN", "WARNING", "ERROR"])
-    common.add_argument("--dry-run", action="store_true",
-                        help="Show what would be done without executing")
+    common.add_argument("--env", default=None)
+    common.add_argument("--source-masters", default=None)
+    common.add_argument("--target-masters", default=None)
+    common.add_argument("--dry-run", action="store_true")
+    common.add_argument("--verbose", "-v", action="store_true")
 
-    sub = p.add_subparsers(dest="command", help="Command to run")
+    sub = p.add_subparsers(dest="command", required=True)
 
     ct = sub.add_parser("copy-table", parents=[common],
                         help="Copy a single Kudu table")
@@ -431,6 +579,11 @@ def build_parser():
                     help="JSON predicates for partial copy")
     ct.add_argument("--verify-after", action="store_true",
                     help="Verify row counts after copy")
+
+    cti = sub.add_parser("copy-table-impala", parents=[common],
+                        help="Copy Kudu table via Parquet staging (use when kudu table copy fails)")
+    cti.add_argument("--table", "-t", required=True,
+                     help="Kudu table (e.g. impala::db.table)")
 
     cd = sub.add_parser("copy-db", parents=[common],
                         help="Copy all Kudu tables for a database")
@@ -455,47 +608,42 @@ def build_parser():
 def _resolve_env_path(args):
     if args.env:
         return args.env
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(script_dir, "impala_migrate.env")
-
-
-def _build_config(args):
-    overrides = {}
-    if getattr(args, "source_masters", None):
-        overrides["SOURCE_KUDU_MASTERS"] = args.source_masters
-    if getattr(args, "target_masters", None):
-        overrides["TARGET_KUDU_MASTERS"] = args.target_masters
-    return Config(_resolve_env_path(args), overrides)
+    default = os.path.join(os.path.dirname(__file__), "impala_migrate.env")
+    return default
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    _setup_logging("DEBUG" if getattr(args, "verbose", False) else "INFO")
 
-    if not args.command:
-        parser.print_help()
-        sys.exit(1)
-
-    _setup_logging(args.log_level)
-
-    cfg = _build_config(args)
-    dry_run = getattr(args, "dry_run", False)
-
-    if dry_run:
-        log.info("%s*** DRY-RUN MODE ***%s", _Y, _RST)
-
-    preflight_checks(cfg)
-
-    client = KuduClient(cfg, dry_run=dry_run)
+    env_path = _resolve_env_path(args)
+    cli_overrides = {}
+    if getattr(args, "source_masters", None):
+        cli_overrides["SOURCE_KUDU_MASTERS"] = args.source_masters
+    if getattr(args, "target_masters", None):
+        cli_overrides["TARGET_KUDU_MASTERS"] = args.target_masters
+    cfg = Config(env_path, cli_overrides)
+    preflight_checks(cfg, require_kudu=(args.command != "copy-table-impala"))
+    client = KuduClient(cfg, dry_run=getattr(args, "dry_run", False))
 
     if args.command == "copy-table":
         cmd_copy_table(cfg, args, client)
+    elif args.command == "copy-table-impala":
+        database, table = _parse_impala_table(args.table)
+        log.info("%s=== Copying Kudu table via Impala (Parquet staging): %s.%s ===%s",
+                 _C, database, table, _RST)
+        copy_table_via_impala(cfg, database, table, dry_run=getattr(args, "dry_run", False))
+        log.info("%s=> Copy complete%s", _G, _RST)
     elif args.command == "copy-db":
         cmd_copy_db(cfg, args, client)
     elif args.command == "verify":
         cmd_verify(cfg, args, client)
     elif args.command == "list-tables":
         cmd_list_tables(cfg, args, client)
+    else:
+        parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
