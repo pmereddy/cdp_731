@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import argparse
 import csv
+import getpass
 import os
 import re
 import sys
@@ -112,7 +113,8 @@ def main():
                     help="Oozie server URL (e.g. http://oozie-host:11000/oozie)")
     ap.add_argument("--auth-mode", choices=["none", "basic", "kerberos"], default="none")
     ap.add_argument("--user", default="")
-    ap.add_argument("--password", default="")
+    ap.add_argument("--password", default="",
+                    help="Password for basic auth (leave empty to be prompted securely)")
     ap.add_argument("--verify-tls", action="store_true", default=False)
     ap.add_argument("--len", type=int, default=100,
                     help="Page size for job list (default: 100)")
@@ -132,6 +134,9 @@ def main():
     if args.auth_mode == "kerberos" and not HAS_KRB:
         print("ERROR: Kerberos auth requires requests-kerberos. pip install requests-kerberos", file=sys.stderr)
         sys.exit(1)
+
+    if args.auth_mode == "basic" and args.user and not args.password:
+        args.password = getpass.getpass("Password for {}: ".format(args.user))
 
     session = get_session(args)
     base = args.oozie_url
