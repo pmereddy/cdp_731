@@ -2,20 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 CDH 6.3.3 discovery. Python 3.6+ compatible.
-Authentication modes (--auth-mode):
-  cookie   - Pass a browser session cookie string (default, most reliable)
-  login    - Authenticate via form login (j_spring_security_check) to get a cookie
-  basic    - HTTP Basic auth (may not work if Navigator uses form-based auth)
+Bulk-export Cloudera Navigator data directly from its MySQL/Postgres databases.
 
-Produces:
-  - navigator_objects.csv  -- entities (HDFS paths, Hive tables, etc.)
-  - navigator_access.csv   -- audit events
-  - navigator_lineage.csv  -- relations/lineage edges
+Navigator uses TWO databases (may be on the same or different hosts):
+  1. Audit DB   -- every Hive/Impala/HDFS/Spark access event (who did what, when)
+  2. Metadata DB -- entities, lineage relations, policies, tags
 
-Endpoints used:
-  GET /api/v3/entities?query=...&limit=&offset=
-  GET /api/v3/audits?startTime=&endTime=&limit=&offset=
-  GET /api/v3/relations (or lineage) for relation edges
+This script auto-discovers tables in both databases and extracts:
+  - navigator_objects.csv   -- entities (tables, files, databases, queries)
+  - navigator_access.csv    -- audit events (access patterns)
+  - navigator_lineage.csv   -- lineage relations (data flow edges)
+
+Find credentials in Cloudera Manager:
+  CM -> Cloudera Management Service -> Configuration -> search "Navigator"
+  Or on the Navigator host:
+    grep -r 'nav.*db\|database' /var/run/cloudera-scm-agent/process/*/navigator.properties
+
+Requires: PyMySQL (--db-type mysql) or psycopg2-binary (--db-type postgres).
+
+Usage:
+  # Single DB (audit + metadata in same database)
+  python3 navigator_db_2_csv.py --db-host nav-db-host --db-name nav \\
+    --db-user nav --out-objects navigator_objects.csv
+
+  # Separate DBs for audit and metadata
+  python3 navigator_db_2_csv.py --db-host nav-db-host \\
+    --audit-db-name nav_audit --meta-db-name nav_metadata \\
+    --db-user nav --out-objects navigator_objects.csv
 """
 
 from __future__ import print_function
@@ -24,14 +37,21 @@ import argparse
 import csv
 import getpass
 import os
+import re
 import sys
-import time
-from urllib.parse import urlencode, urljoin
 
 try:
-    import requests
+    import pymysql
+    HAS_PYMYSQL = True
 except ImportError:
-    requests = None
+    HAS_PYMYSQL = False
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
 
 
 OBJECT_FIELDS = ["service", "object_type", "object_id", "owner", "group", "extra"]
@@ -41,345 +61,618 @@ ACCESS_FIELDS = [
 ]
 LINEAGE_FIELDS = [
     "from_object_type", "from_object_id",
-    "to_object_type", "to_object_id",
-    "relation",
+    "to_object_type", "to_object_id", "relation",
 ]
 
-# Navigator entity type -> (service, object_type) for dependency model
-NAV_TYPE_TO_SERVICE = {
-    "FILE": ("hdfs", "hdfs_path"),
-    "DIRECTORY": ("hdfs", "hdfs_path"),
-    "TABLE": ("impala", "hive_table"),
-    "VIEW": ("impala", "hive_table"),
-    "DATABASE": ("impala", "hive_database"),
-    "COLUMN": ("impala", "hive_column"),
-    "PARTITION": ("impala", "hive_partition"),
-    "KUDU_TABLE": ("kudu", "kudu_table"),
-    "TOPIC": ("kafka", "topic"),
-}
+LOG_PREFIX = "[nav_db]"
 
 
-def get_entity_id(entity):
-    """Prefer identity, then path, then name for object_id."""
-    identity = entity.get("identity") or entity.get("id")
-    if identity:
-        return str(identity).strip()
-    path = entity.get("path") or (entity.get("attributes") or {}).get("path")
-    if path:
-        return path.strip() if isinstance(path, str) else str(path)
-    name = entity.get("name") or (entity.get("attributes") or {}).get("name")
-    if name:
-        return name.strip() if isinstance(name, str) else str(name)
-    return ""
+def get_connection(db_type, host, port, db_name, user, password):
+    if db_type == "mysql":
+        if not HAS_PYMYSQL:
+            print("ERROR: PyMySQL not installed. pip install PyMySQL", file=sys.stderr)
+            sys.exit(1)
+        return pymysql.connect(
+            host=host, port=port, user=user,
+            password=password or None, database=db_name,
+            cursorclass=pymysql.cursors.DictCursor,
+            connect_timeout=30, read_timeout=600,
+        )
+    elif db_type == "postgres":
+        if not HAS_PSYCOPG2:
+            print("ERROR: psycopg2 not installed. pip install psycopg2-binary", file=sys.stderr)
+            sys.exit(1)
+        return psycopg2.connect(
+            host=host, port=port, dbname=db_name,
+            user=user, password=password or None,
+        )
+    else:
+        print("ERROR: --db-type must be mysql or postgres", file=sys.stderr)
+        sys.exit(1)
 
 
-def get_entity_type(entity):
-    """Return Navigator type string (e.g. FILE, TABLE)."""
-    t = entity.get("type") or (entity.get("attributes") or {}).get("type")
-    if t:
-        return (t.strip() if isinstance(t, str) else str(t)).upper()
-    return "UNKNOWN"
+def list_tables(conn, db_type):
+    """Return list of table names in the current database."""
+    if db_type == "mysql":
+        with conn.cursor() as cur:
+            cur.execute("SHOW TABLES")
+            return [list(r.values())[0] for r in cur.fetchall()]
+    else:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public' ORDER BY table_name
+        """)
+        tables = [r[0] for r in cur.fetchall()]
+        cur.close()
+        return tables
 
 
-def get_owner(entity):
-    """Extract owner from entity attributes if present."""
-    attrs = entity.get("attributes") or {}
-    return attrs.get("owner") or attrs.get("ownerName") or entity.get("ownerName") or ""
+def describe_table(conn, db_type, table):
+    """Return list of column names for a table."""
+    if db_type == "mysql":
+        with conn.cursor() as cur:
+            cur.execute("DESCRIBE `{}`".format(table))
+            return [r.get("Field") or list(r.values())[0] for r in cur.fetchall()]
+    else:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = %s
+            ORDER BY ordinal_position
+        """, (table,))
+        cols = [r[0] for r in cur.fetchall()]
+        cur.close()
+        return cols
 
 
-def entity_to_object_row(entity):
-    """Map Navigator entity to dependency_objects row."""
-    obj_id = get_entity_id(entity)
-    if not obj_id:
-        return None
-    nav_type = get_entity_type(entity)
-    service, object_type = NAV_TYPE_TO_SERVICE.get(
-        nav_type, ("navigator", nav_type.lower() if nav_type else "entity")
-    )
-    return {
-        "service": service,
-        "object_type": object_type,
-        "object_id": obj_id,
-        "owner": get_owner(entity),
-        "group": "",
-        "extra": "navigator_type={}".format(nav_type),
-    }
+def count_rows(conn, db_type, table):
+    """Return approximate row count."""
+    q = 'SELECT COUNT(*) AS cnt FROM "{}"'.format(table) if db_type == "postgres" \
+        else "SELECT COUNT(*) AS cnt FROM `{}`".format(table)
+    try:
+        if db_type == "mysql":
+            with conn.cursor() as cur:
+                cur.execute(q)
+                return cur.fetchone().get("cnt", 0)
+        else:
+            cur = conn.cursor()
+            cur.execute(q)
+            cnt = cur.fetchone()[0]
+            cur.close()
+            return cnt
+    except Exception:
+        return -1
 
 
-def fetch_entities(session, base_url, entity_types, limit, offset_step, sleep_ms):
-    """Paginate through /api/v3/entities for given types. Yields entity dicts."""
-    seen = set()
-    for nav_type in entity_types:
-        query = "type:{}".format(nav_type)
-        offset = 0
+def fetch_rows(conn, db_type, sql, batch_size):
+    """Generic row fetcher. Yields dicts."""
+    if db_type == "mysql":
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            while True:
+                rows = cur.fetchmany(batch_size)
+                if not rows:
+                    break
+                for r in rows:
+                    yield r
+    else:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(sql)
         while True:
-            params = {"query": query, "limit": limit, "offset": offset}
-            url = "{}/entities?{}".format(base_url.rstrip("/"), urlencode(params))
-            resp = session.get(url, timeout=120)
-            if not resp.ok:
-                print("[navigator] WARN: entities {} offset {} -> HTTP {}".format(
-                    nav_type, offset, resp.status_code), file=sys.stderr)
+            rows = cur.fetchmany(batch_size)
+            if not rows:
                 break
-            data = resp.json()
-            items = data if isinstance(data, list) else (data.get("entities") or data.get("items") or [])
-            if not items:
-                break
-            for ent in items:
-                eid = ent.get("identity") or ent.get("id") or get_entity_id(ent)
-                if eid and eid not in seen:
-                    seen.add(eid)
-                    yield ent
-            if len(items) < limit:
-                break
-            offset += len(items)
-            print("[navigator] entities type={} offset={} fetched={} total_seen={}".format(
-                nav_type, offset, len(items), len(seen)), file=sys.stderr)
-            time.sleep(sleep_ms / 1000.0)
+            for r in rows:
+                yield dict(r)
+        cur.close()
 
 
-def fetch_audits(session, base_url, start_time, end_time, limit, offset_step, sleep_ms):
-    """Paginate through /api/v3/audits. Yields event dicts."""
-    offset = 0
-    while True:
-        params = {"limit": limit, "offset": offset}
-        if start_time:
-            params["startTime"] = start_time
-        if end_time:
-            params["endTime"] = end_time
-        url = "{}/audits?{}".format(base_url.rstrip("/"), urlencode(params))
-        resp = session.get(url, timeout=120)
-        if not resp.ok:
-            print("[navigator] WARN: audits offset {} -> HTTP {}".format(offset, resp.status_code), file=sys.stderr)
-            break
-        data = resp.json()
-        items = data if isinstance(data, list) else (data.get("audits") or data.get("events") or data.get("items") or [])
-        if not items:
-            break
-        for evt in items:
-            yield evt
-        if len(items) < limit:
-            break
-        offset += len(items)
-        print("[navigator] audits offset={} fetched={}".format(offset, len(items)), file=sys.stderr)
-        time.sleep(sleep_ms / 1000.0)
+def s(val):
+    if val is None:
+        return ""
+    return str(val).strip()
 
 
-def audit_to_access_row(evt):
-    """Map Navigator audit event to dependency_access row. Field names vary by Navigator version."""
-    ts = evt.get("timestamp") or evt.get("time") or evt.get("eventTime") or ""
-    if isinstance(ts, (int, float)):
+def format_ts(val):
+    if val is None:
+        return ""
+    if hasattr(val, "strftime"):
+        return val.strftime("%Y-%m-%dT%H:%M:%SZ")
+    v = str(val).strip()
+    if v.isdigit() and len(v) >= 13:
         from datetime import datetime
-        ts = datetime.utcfromtimestamp(ts / 1000.0).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else ""
-    user = evt.get("user") or evt.get("username") or evt.get("actor") or ""
-    op = evt.get("operation") or evt.get("action") or evt.get("accessType") or "ACCESS"
-    resource = evt.get("resource") or evt.get("resourcePath") or evt.get("path") or evt.get("objectId") or ""
-    service = evt.get("service") or evt.get("serviceName") or "navigator"
-    obj_type = evt.get("resourceType") or evt.get("objectType") or "entity"
-    return {
-        "window_start": ts if isinstance(ts, str) else str(ts),
-        "service": service,
-        "user": user,
-        "do_as": evt.get("doAs") or "",
-        "client_ip": evt.get("ip") or evt.get("clientIp") or "",
-        "app_name": evt.get("application") or evt.get("appName") or "",
-        "op": op,
-        "object_type": obj_type,
-        "object_id": resource if isinstance(resource, str) else str(resource),
-        "cnt": 1,
+        return datetime.utcfromtimestamp(int(v) / 1000.0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return v
+
+
+# ------------------------------------------------------------------ #
+#  Column matching helpers                                            #
+# ------------------------------------------------------------------ #
+
+def find_col(columns, *candidates):
+    """Find the first matching column name (case-insensitive)."""
+    lower_cols = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand.lower() in lower_cols:
+            return lower_cols[cand.lower()]
+    return None
+
+
+def find_audit_table(tables):
+    """Identify the audit events table from table list."""
+    candidates = [
+        "AUDIT_COMMAND_LOG", "audit_command_log",
+        "NAVIGATOR_AUDIT_EVENTS", "navigator_audit_events",
+        "AUDIT_EVENTS", "audit_events",
+        "NAV_AUDIT_EVENTS", "nav_audit_events",
+        "HDFS_AUDIT", "hdfs_audit",
+    ]
+    for c in candidates:
+        if c in tables:
+            return c
+    for t in tables:
+        tl = t.lower()
+        if "audit" in tl and ("event" in tl or "command" in tl or "log" in tl):
+            return t
+    for t in tables:
+        if "audit" in t.lower():
+            return t
+    return None
+
+
+def find_entity_tables(tables):
+    """Identify entity/metadata tables."""
+    result = {}
+    for t in tables:
+        tl = t.lower()
+        if "entit" in tl or "element" in tl or tl.startswith("nav_element"):
+            result["entities"] = t
+        if "relation" in tl and "lineage" not in tl:
+            result["relations"] = t
+        if "lineage" in tl:
+            result["lineage"] = t
+        if "policy" in tl or "policies" in tl:
+            result["policies"] = t
+        if "tag" in tl and "stag" not in tl:
+            result["tags"] = t
+    return result
+
+
+# ------------------------------------------------------------------ #
+#  Extraction functions                                               #
+# ------------------------------------------------------------------ #
+
+def extract_audit(conn, db_type, table, columns, batch_size, limit):
+    """Extract audit events. Returns list of access row dicts."""
+    cols = columns
+    c_ts = find_col(cols, "EVENT_TIME", "event_time", "TIMESTAMP", "timestamp",
+                    "TIME", "time", "AUDIT_TIME", "audit_time", "CREATED_AT")
+    c_user = find_col(cols, "USERNAME", "username", "USER_NAME", "user_name",
+                      "USER", "user", "PRINCIPAL")
+    c_ip = find_col(cols, "IP_ADDR", "ip_addr", "IP_ADDRESS", "ip_address",
+                    "IPADDRESS", "ipAddress", "CLIENT_IP", "client_ip")
+    c_op = find_col(cols, "OPERATION", "operation", "COMMAND", "command",
+                    "ACTION", "action", "OP", "op", "OPERATION_TEXT")
+    c_service = find_col(cols, "SERVICE_NAME", "service_name", "SERVICE", "service",
+                         "COMPONENT", "component")
+    c_resource = find_col(cols, "RESOURCE_PATH", "resource_path", "RESOURCE", "resource",
+                          "TABLE_NAME", "table_name", "OBJECT_ID", "URL", "url",
+                          "SRC", "src", "DST", "dst")
+    c_db = find_col(cols, "DATABASE_NAME", "database_name", "DB_NAME", "db_name",
+                    "DATABASE", "database")
+    c_tbl = find_col(cols, "TABLE_NAME", "table_name")
+    c_allowed = find_col(cols, "ALLOWED", "allowed", "RESULT", "result")
+    c_obj_type = find_col(cols, "OBJECT_TYPE", "object_type", "RESOURCE_TYPE",
+                          "resource_type", "ENTITY_TYPE")
+    c_app = find_col(cols, "APPLICATION", "application", "APP_NAME",
+                     "OPERATION_TEXT", "operation_text")
+
+    select_cols = []
+    for c in [c_ts, c_user, c_ip, c_op, c_service, c_resource, c_db, c_tbl,
+              c_allowed, c_obj_type, c_app]:
+        if c and c not in select_cols:
+            select_cols.append(c)
+
+    if not select_cols:
+        print("{} WARN: no recognizable columns in audit table {}".format(LOG_PREFIX, table), file=sys.stderr)
+        return []
+
+    order_col = c_ts or select_cols[0]
+    if db_type == "postgres":
+        quoted = ', '.join('"{}"'.format(c) for c in select_cols)
+        sql = 'SELECT {cols} FROM "{tbl}" ORDER BY "{order}" DESC'.format(
+            cols=quoted, tbl=table, order=order_col)
+    else:
+        quoted = ", ".join("`{}`".format(c) for c in select_cols)
+        sql = "SELECT {cols} FROM `{tbl}` ORDER BY `{order}` DESC".format(
+            cols=quoted, tbl=table, order=order_col)
+
+    if limit:
+        sql += " LIMIT {}".format(limit)
+
+    rows_out = []
+    count = 0
+    for r in fetch_rows(conn, db_type, sql, batch_size):
+        ts = format_ts(r.get(c_ts)) if c_ts else ""
+        user = s(r.get(c_user)) if c_user else ""
+        ip = s(r.get(c_ip)) if c_ip else ""
+        op = s(r.get(c_op)) if c_op else ""
+        svc = s(r.get(c_service)) if c_service else "navigator"
+        resource = s(r.get(c_resource)) if c_resource else ""
+        db_name = s(r.get(c_db)) if c_db else ""
+        tbl_name = s(r.get(c_tbl)) if c_tbl and c_tbl != c_resource else ""
+        obj_type = s(r.get(c_obj_type)) if c_obj_type else ""
+        app = s(r.get(c_app)) if c_app else ""
+
+        if db_name and tbl_name and not resource:
+            resource = "{}.{}".format(db_name, tbl_name)
+        elif db_name and not resource:
+            resource = db_name
+
+        rows_out.append({
+            "window_start": ts,
+            "service": svc.lower() if svc else "navigator",
+            "user": user,
+            "do_as": "",
+            "client_ip": ip,
+            "app_name": app,
+            "op": op.upper() if op else "ACCESS",
+            "object_type": obj_type.lower() if obj_type else "entity",
+            "object_id": resource,
+            "cnt": 1,
+        })
+        count += 1
+        if count % 500000 == 0:
+            print("{} audit: {} rows...".format(LOG_PREFIX, count), file=sys.stderr)
+
+    return rows_out
+
+
+def extract_entities(conn, db_type, table, columns, batch_size, limit):
+    """Extract entity/metadata rows. Returns list of object row dicts."""
+    cols = columns
+    c_id = find_col(cols, "IDENTITY", "identity", "ID", "id", "ENTITY_ID",
+                    "entity_id", "SOURCE_ID", "source_id")
+    c_type = find_col(cols, "ENTITY_TYPE", "entity_type", "TYPE", "type",
+                      "SOURCE_TYPE", "source_type")
+    c_name = find_col(cols, "ORIGINAL_NAME", "original_name", "DISPLAY_NAME",
+                      "display_name", "NAME", "name")
+    c_path = find_col(cols, "FILE_SYSTEM_PATH", "file_system_path", "PATH", "path",
+                      "SOURCE_URL", "source_url")
+    c_owner = find_col(cols, "OWNER_NAME", "owner_name", "OWNER", "owner")
+    c_desc = find_col(cols, "DESCRIPTION", "description", "ORIGINAL_DESCRIPTION")
+    c_deleted = find_col(cols, "DELETED", "deleted")
+    c_db = find_col(cols, "PARENT_NAME", "parent_name", "DATABASE_NAME",
+                    "database_name", "DB_NAME")
+    c_svc = find_col(cols, "SOURCE_NAME", "source_name", "SERVICE_NAME",
+                     "service_name", "CLUSTER_NAME")
+
+    select_cols = []
+    for c in [c_id, c_type, c_name, c_path, c_owner, c_desc, c_deleted, c_db, c_svc]:
+        if c and c not in select_cols:
+            select_cols.append(c)
+
+    if not select_cols:
+        print("{} WARN: no recognizable columns in entity table {}".format(LOG_PREFIX, table), file=sys.stderr)
+        return []
+
+    if db_type == "postgres":
+        quoted = ', '.join('"{}"'.format(c) for c in select_cols)
+        sql = 'SELECT {cols} FROM "{tbl}"'.format(cols=quoted, tbl=table)
+    else:
+        quoted = ", ".join("`{}`".format(c) for c in select_cols)
+        sql = "SELECT {cols} FROM `{tbl}`".format(cols=quoted, tbl=table)
+
+    if c_deleted:
+        if db_type == "postgres":
+            sql += ' WHERE "{}" = false OR "{}" IS NULL'.format(c_deleted, c_deleted)
+        else:
+            sql += " WHERE `{}` = 0 OR `{}` = 'false' OR `{}` IS NULL".format(
+                c_deleted, c_deleted, c_deleted)
+
+    if limit:
+        sql += " LIMIT {}".format(limit)
+
+    type_map = {
+        "TABLE": ("hive", "hive_table"),
+        "VIEW": ("hive", "hive_view"),
+        "DATABASE": ("hive", "hive_database"),
+        "FILE": ("hdfs", "hdfs_path"),
+        "DIRECTORY": ("hdfs", "hdfs_path"),
+        "FSDIRECTORY": ("hdfs", "hdfs_path"),
+        "FSFILE": ("hdfs", "hdfs_path"),
+        "HDFS_FILE": ("hdfs", "hdfs_path"),
+        "HDFS_DIRECTORY": ("hdfs", "hdfs_path"),
+        "COLUMN": ("hive", "hive_column"),
+        "FIELD": ("hive", "hive_column"),
+        "HIVE_TABLE": ("hive", "hive_table"),
+        "HIVE_DATABASE": ("hive", "hive_database"),
+        "HIVE_COLUMN": ("hive", "hive_column"),
+        "IMPALA_QUERY": ("impala", "impala_query"),
+        "HIVE_QUERY": ("hive", "hive_query"),
+        "MAPREDUCE": ("yarn", "mr_job"),
+        "MR_JOB": ("yarn", "mr_job"),
+        "SPARK": ("spark", "spark_app"),
+        "PIG": ("pig", "pig_script"),
+        "OOZIE": ("oozie", "oozie_workflow"),
+        "SQOOP": ("sqoop", "sqoop_job"),
+        "KUDU_TABLE": ("kudu", "kudu_table"),
     }
 
+    rows_out = []
+    count = 0
+    for r in fetch_rows(conn, db_type, sql, batch_size):
+        etype = s(r.get(c_type)).upper() if c_type else "UNKNOWN"
+        name = s(r.get(c_name)) if c_name else ""
+        path = s(r.get(c_path)) if c_path else ""
+        eid = s(r.get(c_id)) if c_id else ""
+        owner = s(r.get(c_owner)) if c_owner else ""
+        db_name = s(r.get(c_db)) if c_db else ""
+        svc = s(r.get(c_svc)) if c_svc else ""
 
-def fetch_relations(session, base_url, entity_ids_batch, relation_types, limit, sleep_ms):
-    """Fetch relations for a batch of entity IDs. Returns list of relation dicts."""
-    if not entity_ids_batch:
+        obj_id = path or name or eid
+        if not obj_id:
+            continue
+
+        if db_name and name and etype in ("TABLE", "VIEW", "HIVE_TABLE"):
+            obj_id = "{}.{}".format(db_name, name)
+
+        service, obj_type = type_map.get(etype, ("navigator", etype.lower()))
+
+        extra_parts = []
+        if eid:
+            extra_parts.append("nav_id={}".format(eid))
+        if etype:
+            extra_parts.append("nav_type={}".format(etype))
+        if svc:
+            extra_parts.append("source={}".format(svc))
+
+        rows_out.append({
+            "service": service,
+            "object_type": obj_type,
+            "object_id": obj_id,
+            "owner": owner,
+            "group": "",
+            "extra": "|".join(extra_parts),
+        })
+        count += 1
+        if count % 100000 == 0:
+            print("{} entities: {} rows...".format(LOG_PREFIX, count), file=sys.stderr)
+
+    return rows_out
+
+
+def extract_relations(conn, db_type, table, columns, batch_size, limit):
+    """Extract lineage/relation rows. Returns list of lineage row dicts."""
+    cols = columns
+    c_from = find_col(cols, "SOURCE_ID", "source_id", "FROM_ENTITY_ID",
+                      "from_entity_id", "ENDPOINT1", "endpoint1",
+                      "FROM_ID", "from_id", "LEFT_ENTITY_ID")
+    c_to = find_col(cols, "TARGET_ID", "target_id", "TO_ENTITY_ID",
+                    "to_entity_id", "ENDPOINT2", "endpoint2",
+                    "TO_ID", "to_id", "RIGHT_ENTITY_ID")
+    c_type = find_col(cols, "TYPE", "type", "RELATION_TYPE", "relation_type",
+                      "REL_TYPE", "rel_type")
+    c_from_type = find_col(cols, "SOURCE_TYPE", "source_type",
+                           "FROM_ENTITY_TYPE", "from_entity_type")
+    c_to_type = find_col(cols, "TARGET_TYPE", "target_type",
+                         "TO_ENTITY_TYPE", "to_entity_type")
+
+    select_cols = []
+    for c in [c_from, c_to, c_type, c_from_type, c_to_type]:
+        if c and c not in select_cols:
+            select_cols.append(c)
+
+    if not c_from or not c_to:
+        print("{} WARN: cannot identify from/to columns in relation table {}".format(
+            LOG_PREFIX, table), file=sys.stderr)
         return []
-    params = {"limit": limit}
-    if entity_ids_batch:
-        params["entityIds"] = ",".join(str(i) for i in entity_ids_batch[:50])
-    if relation_types:
-        params["types"] = ",".join(relation_types)
-    url = "{}/relations?{}".format(base_url.rstrip("/"), urlencode(params))
-    resp = session.get(url, timeout=120)
-    if not resp.ok:
-        return []
-    data = resp.json()
-    items = data if isinstance(data, list) else (data.get("relations") or data.get("items") or [])
-    time.sleep(sleep_ms / 1000.0)
-    return items
+
+    if db_type == "postgres":
+        quoted = ', '.join('"{}"'.format(c) for c in select_cols)
+        sql = 'SELECT {cols} FROM "{tbl}"'.format(cols=quoted, tbl=table)
+    else:
+        quoted = ", ".join("`{}`".format(c) for c in select_cols)
+        sql = "SELECT {cols} FROM `{tbl}`".format(cols=quoted, tbl=table)
+
+    if limit:
+        sql += " LIMIT {}".format(limit)
+
+    rows_out = []
+    count = 0
+    for r in fetch_rows(conn, db_type, sql, batch_size):
+        from_id = s(r.get(c_from))
+        to_id = s(r.get(c_to))
+        if not from_id or not to_id:
+            continue
+        rel_type = s(r.get(c_type)) if c_type else "DATA_FLOW"
+        from_type = s(r.get(c_from_type)).lower() if c_from_type else "entity"
+        to_type = s(r.get(c_to_type)).lower() if c_to_type else "entity"
+
+        rows_out.append({
+            "from_object_type": from_type,
+            "from_object_id": from_id,
+            "to_object_type": to_type,
+            "to_object_id": to_id,
+            "relation": rel_type,
+        })
+        count += 1
+        if count % 500000 == 0:
+            print("{} relations: {} rows...".format(LOG_PREFIX, count), file=sys.stderr)
+
+    return rows_out
 
 
-def relation_to_lineage_row(rel, id_to_entity):
-    """Map Navigator relation to lineage CSV row. id_to_entity: identity -> entity dict."""
-    from_id = rel.get("fromEntityId") or rel.get("fromId") or rel.get("sourceId")
-    to_id = rel.get("toEntityId") or rel.get("toId") or rel.get("targetId")
-    if not from_id or not to_id:
-        return None
-    from_ent = id_to_entity.get(str(from_id)) or id_to_entity.get(from_id)
-    to_ent = id_to_entity.get(str(to_id)) or id_to_entity.get(to_id)
-    rel_type = rel.get("type") or rel.get("relationType") or "RELATES_TO"
-    return {
-        "from_object_type": get_entity_type(from_ent) if from_ent else "entity",
-        "from_object_id": get_entity_id(from_ent) if from_ent else str(from_id),
-        "to_object_type": get_entity_type(to_ent) if to_ent else "entity",
-        "to_object_id": get_entity_id(to_ent) if to_ent else str(to_id),
-        "relation": rel_type,
-    }
+# ------------------------------------------------------------------ #
+#  Main                                                               #
+# ------------------------------------------------------------------ #
+
+def process_database(conn, db_type, db_name, args, object_rows, access_rows, lineage_rows):
+    """Process a single Navigator database -- discover tables and extract data."""
+    print("{} --- Database: {} ---".format(LOG_PREFIX, db_name), file=sys.stderr)
+
+    tables = list_tables(conn, db_type)
+    print("{} Tables found: {}".format(LOG_PREFIX, tables), file=sys.stderr)
+
+    # Discover and describe each table
+    table_info = {}
+    for t in tables:
+        try:
+            cols = describe_table(conn, db_type, t)
+            cnt = count_rows(conn, db_type, t)
+            table_info[t] = {"columns": cols, "count": cnt}
+            print("{}   {:40s} {:>10,} rows  cols={}".format(
+                LOG_PREFIX, t, cnt, cols[:8]), file=sys.stderr)
+        except Exception as e:
+            print("{}   {:40s} ERROR: {}".format(LOG_PREFIX, t, e), file=sys.stderr)
+
+    # Find audit table
+    audit_table = find_audit_table(tables)
+    if audit_table and audit_table in table_info:
+        info = table_info[audit_table]
+        print("{} Extracting audit from: {} ({:,} rows)".format(
+            LOG_PREFIX, audit_table, info["count"]), file=sys.stderr)
+        rows = extract_audit(conn, db_type, audit_table, info["columns"],
+                             args.batch_size, args.audit_limit)
+        access_rows.extend(rows)
+        print("{} Extracted {} audit rows".format(LOG_PREFIX, len(rows)), file=sys.stderr)
+
+    # Find entity tables
+    entity_map = find_entity_tables(tables)
+    if "entities" in entity_map:
+        t = entity_map["entities"]
+        info = table_info.get(t, {})
+        if info:
+            print("{} Extracting entities from: {} ({:,} rows)".format(
+                LOG_PREFIX, t, info["count"]), file=sys.stderr)
+            rows = extract_entities(conn, db_type, t, info["columns"],
+                                    args.batch_size, args.entity_limit)
+            object_rows.extend(rows)
+            print("{} Extracted {} entity rows".format(LOG_PREFIX, len(rows)), file=sys.stderr)
+
+    # Find relations/lineage tables
+    for key in ("relations", "lineage"):
+        if key in entity_map:
+            t = entity_map[key]
+            info = table_info.get(t, {})
+            if info:
+                print("{} Extracting {} from: {} ({:,} rows)".format(
+                    LOG_PREFIX, key, t, info["count"]), file=sys.stderr)
+                rows = extract_relations(conn, db_type, t, info["columns"],
+                                         args.batch_size, args.lineage_limit)
+                lineage_rows.extend(rows)
+                print("{} Extracted {} {} rows".format(LOG_PREFIX, len(rows), key), file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="CDH discovery: export Cloudera Navigator entities, audits, and lineage to CSV."
+        description="Bulk-export Cloudera Navigator data from its MySQL/Postgres databases."
     )
-    ap.add_argument("--base-url", required=True,
-                    help="Navigator API base URL (e.g. https://navigator-host:7187/api/v3)")
-    ap.add_argument("--auth-mode", choices=["cookie", "login", "basic"], default="cookie",
-                    help="Authentication mode (default: cookie)")
-    ap.add_argument("--cookie", default="",
-                    help="Browser cookie string for cookie auth (e.g. 'JSESSIONID=abc123'). "
-                         "Copy from browser DevTools -> Network -> Request Headers -> Cookie")
-    ap.add_argument("--user", default="", help="Username for login/basic auth")
-    ap.add_argument("--password", default="",
-                    help="Password for login/basic auth (leave empty to be prompted)")
-    ap.add_argument("--verify-tls", action="store_true", default=False,
-                    help="Verify TLS certificates")
-    ap.add_argument("--entity-types", default="FILE,DIRECTORY,TABLE,VIEW,DATABASE,KUDU_TABLE",
-                    help="Comma-separated entity types to fetch (default: FILE,DIRECTORY,TABLE,VIEW,DATABASE,KUDU_TABLE)")
-    ap.add_argument("--limit", type=int, default=100,
-                    help="Page size for entities and audits (default: 100)")
-    ap.add_argument("--sleep-ms", type=int, default=200,
-                    help="Sleep between API pages in ms (default: 200)")
-    ap.add_argument("--start-time", default="",
-                    help="Audit start time (Navigator format, e.g. 2024-01-01T00:00:00Z)")
-    ap.add_argument("--end-time", default="",
-                    help="Audit end time (Navigator format)")
-    ap.add_argument("--skip-entities", action="store_true", default=False,
-                    help="Do not fetch entities")
-    ap.add_argument("--skip-audits", action="store_true", default=False,
-                    help="Do not fetch audits")
-    ap.add_argument("--skip-lineage", action="store_true", default=False,
-                    help="Do not fetch relations/lineage (default: fetch lineage if entities were fetched)")
-    ap.add_argument("--fetch-lineage", action="store_true", default=False,
-                    help="Explicitly fetch relations/lineage (same as not using --skip-lineage)")
-    ap.add_argument("--out-objects", default="navigator_objects.csv",
-                    help="Output CSV for entities (default: navigator_objects.csv)")
-    ap.add_argument("--out-access", default="navigator_access.csv",
-                    help="Output CSV for audits (default: navigator_access.csv)")
-    ap.add_argument("--out-lineage", default="navigator_lineage.csv",
-                    help="Output CSV for lineage edges (default: navigator_lineage.csv)")
+    ap.add_argument("--db-type", choices=["mysql", "postgres"], default="mysql")
+    ap.add_argument("--db-host", default="localhost")
+    ap.add_argument("--db-port", type=int, default=None,
+                    help="Default: 3306 (mysql), 5432 (postgres)")
+    ap.add_argument("--db-user", default="nav")
+    ap.add_argument("--db-password", default="",
+                    help="Leave empty to be prompted securely")
+    ap.add_argument("--db-name", default="",
+                    help="Single database name (if audit+metadata are in one DB)")
+    ap.add_argument("--audit-db-name", default="",
+                    help="Audit database name (if separate from metadata)")
+    ap.add_argument("--meta-db-name", default="",
+                    help="Metadata database name (if separate from audit)")
+    ap.add_argument("--batch-size", type=int, default=10000)
+    ap.add_argument("--audit-limit", type=int, default=0,
+                    help="Max audit rows to extract (0 = all)")
+    ap.add_argument("--entity-limit", type=int, default=0,
+                    help="Max entity rows to extract (0 = all)")
+    ap.add_argument("--lineage-limit", type=int, default=0,
+                    help="Max lineage rows to extract (0 = all)")
+    ap.add_argument("--discover-only", action="store_true",
+                    help="Only discover tables and columns, don't extract data")
+    ap.add_argument("--out-objects", default="navigator_objects.csv")
+    ap.add_argument("--out-access", default="navigator_access.csv")
+    ap.add_argument("--out-lineage", default="navigator_lineage.csv")
     args = ap.parse_args()
 
-    if args.fetch_lineage:
-        args.skip_lineage = False
+    if args.db_port is None:
+        args.db_port = 3306 if args.db_type == "mysql" else 5432
 
-    if requests is None:
-        print("ERROR: requests not installed. Run: pip install requests", file=sys.stderr)
-        sys.exit(1)
+    if args.db_user and not args.db_password:
+        args.db_password = getpass.getpass("Password for {}@{}: ".format(args.db_user, args.db_host))
 
-    session = requests.Session()
-    session.verify = args.verify_tls
-    base_url = args.base_url.rstrip("/")
+    # Determine which database(s) to scan
+    db_names = []
+    if args.db_name:
+        db_names.append(args.db_name)
+    if args.audit_db_name and args.audit_db_name not in db_names:
+        db_names.append(args.audit_db_name)
+    if args.meta_db_name and args.meta_db_name not in db_names:
+        db_names.append(args.meta_db_name)
 
-    # Derive the Navigator root URL from base_url (strip /api/vN)
-    nav_root = base_url
-    for suffix in ("/api/v3", "/api/v9", "/api/v13", "/api"):
-        if nav_root.endswith(suffix):
-            nav_root = nav_root[:-len(suffix)]
-            break
+    if not db_names:
+        # Try common Navigator DB names
+        db_names = ["nav", "navigator", "nav_audit", "nav_metadata",
+                    "cloudera_nav", "scm"]
+        print("{} No --db-name specified. Will try: {}".format(LOG_PREFIX, db_names), file=sys.stderr)
 
-    if args.auth_mode == "cookie":
-        if not args.cookie:
-            args.cookie = getpass.getpass(
-                "Paste browser cookie string (DevTools -> Network -> Cookie header): ")
-        session.headers["Cookie"] = args.cookie
-        print("[navigator] Using cookie auth", file=sys.stderr)
+    object_rows = []
+    access_rows = []
+    lineage_rows = []
 
-    elif args.auth_mode == "login":
-        if not args.user:
-            args.user = input("Navigator username: ")
-        if not args.password:
-            args.password = getpass.getpass("Password for {}: ".format(args.user))
-        login_url = "{}/j_spring_security_check".format(nav_root)
-        resp = session.post(login_url, data={
-            "j_username": args.user,
-            "j_password": args.password,
-        }, allow_redirects=False)
-        if resp.status_code in (200, 302):
-            print("[navigator] Login successful (HTTP {})".format(resp.status_code), file=sys.stderr)
-        else:
-            print("[navigator] Login may have failed (HTTP {}). Trying anyway...".format(
-                resp.status_code), file=sys.stderr)
+    for db_name in db_names:
+        try:
+            conn = get_connection(args.db_type, args.db_host, args.db_port,
+                                  db_name, args.db_user, args.db_password)
+        except Exception as e:
+            print("{} Could not connect to '{}': {}".format(LOG_PREFIX, db_name, e), file=sys.stderr)
+            continue
 
-    elif args.auth_mode == "basic":
-        if not args.user:
-            args.user = input("Navigator username: ")
-        if not args.password:
-            args.password = getpass.getpass("Password for {}: ".format(args.user))
-        session.auth = (args.user, args.password)
-        print("[navigator] Using basic auth", file=sys.stderr)
+        try:
+            if args.discover_only:
+                tables = list_tables(conn, args.db_type)
+                print("{} === {} === ({} tables)".format(LOG_PREFIX, db_name, len(tables)), file=sys.stderr)
+                for t in tables:
+                    try:
+                        cols = describe_table(conn, args.db_type, t)
+                        cnt = count_rows(conn, args.db_type, t)
+                        print("{}   {:40s} {:>10,} rows  {}".format(
+                            LOG_PREFIX, t, cnt, cols), file=sys.stderr)
+                    except Exception as e:
+                        print("{}   {:40s} ERROR: {}".format(LOG_PREFIX, t, e), file=sys.stderr)
+            else:
+                process_database(conn, args.db_type, db_name, args,
+                                 object_rows, access_rows, lineage_rows)
+        finally:
+            conn.close()
 
-    session.headers.setdefault("Content-Type", "application/json")
+    if args.discover_only:
+        print("{} Discovery complete. Re-run without --discover-only to extract data.".format(LOG_PREFIX), file=sys.stderr)
+        return
 
-    entity_types = [t.strip().upper() for t in args.entity_types.split(",") if t.strip()]
+    # Write CSVs
     out_dir = os.path.dirname(os.path.abspath(args.out_objects))
     if out_dir and not os.path.exists(out_dir):
         os.makedirs(out_dir)
 
-    id_to_entity = {}
+    with open(args.out_objects, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=OBJECT_FIELDS)
+        w.writeheader()
+        w.writerows(object_rows)
+    print("{} Wrote {} entity rows to {}".format(LOG_PREFIX, len(object_rows), args.out_objects), file=sys.stderr)
 
-    if not args.skip_entities:
-        print("[navigator] Fetching entities (types={})...".format(entity_types), file=sys.stderr)
-        object_rows = []
-        for ent in fetch_entities(session, base_url, entity_types, args.limit, args.limit, args.sleep_ms):
-            row = entity_to_object_row(ent)
-            if row:
-                object_rows.append(row)
-                eid = get_entity_id(ent)
-                if eid:
-                    id_to_entity[eid] = ent
-                    id_to_entity[str(ent.get("identity") or ent.get("id") or "")] = ent
-        with open(args.out_objects, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=OBJECT_FIELDS)
-            w.writeheader()
-            w.writerows(object_rows)
-        print("[navigator] Wrote {} entities to {}".format(len(object_rows), args.out_objects), file=sys.stderr)
-    else:
-        print("[navigator] Skipping entities (--skip-entities)", file=sys.stderr)
+    with open(args.out_access, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=ACCESS_FIELDS)
+        w.writeheader()
+        w.writerows(access_rows)
+    print("{} Wrote {} audit/access rows to {}".format(LOG_PREFIX, len(access_rows), args.out_access), file=sys.stderr)
 
-    if not args.skip_audits:
-        print("[navigator] Fetching audits...", file=sys.stderr)
-        access_rows = []
-        for evt in fetch_audits(
-            session, base_url,
-            args.start_time or None, args.end_time or None,
-            args.limit, args.limit, args.sleep_ms
-        ):
-            access_rows.append(audit_to_access_row(evt))
-        with open(args.out_access, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=ACCESS_FIELDS)
-            w.writeheader()
-            w.writerows(access_rows)
-        print("[navigator] Wrote {} audit rows to {}".format(len(access_rows), args.out_access), file=sys.stderr)
-    else:
-        print("[navigator] Skipping audits (--skip-audits)", file=sys.stderr)
-
-    if not args.skip_lineage and id_to_entity:
-        print("[navigator] Fetching relations (lineage)...", file=sys.stderr)
-        lineage_rows = []
-        ids_batch = list(id_to_entity.keys())[:1000]
-        rels = fetch_relations(session, base_url, ids_batch, [], args.limit, args.sleep_ms)
-        for rel in rels:
-            row = relation_to_lineage_row(rel, id_to_entity)
-            if row:
-                lineage_rows.append(row)
-        with open(args.out_lineage, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=LINEAGE_FIELDS)
-            w.writeheader()
-            w.writerows(lineage_rows)
-        print("[navigator] Wrote {} lineage edges to {}".format(len(lineage_rows), args.out_lineage), file=sys.stderr)
-    elif not args.skip_lineage:
-        print("[navigator] No entities loaded; skipping lineage. Run without --skip-entities first.", file=sys.stderr)
-    else:
-        print("[navigator] Skipping lineage. Use --fetch-lineage to include relations.", file=sys.stderr)
+    with open(args.out_lineage, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LINEAGE_FIELDS)
+        w.writeheader()
+        w.writerows(lineage_rows)
+    print("{} Wrote {} lineage rows to {}".format(LOG_PREFIX, len(lineage_rows), args.out_lineage), file=sys.stderr)
 
 
 if __name__ == "__main__":
