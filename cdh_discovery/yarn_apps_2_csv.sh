@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
-# CDH 6.3.3 discovery: YARN ResourceManager + Job History Server -> CSV
-# Uses curl with --negotiate (SPNEGO/Kerberos). No Python dependencies needed.
+# CDH 6.3.3 discovery: YARN applications -> CSV
+# Three data sources (use whichever works):
+#   1. --cm-url   : Cloudera Manager API (best -- full history, fast)
+#   2. --rm-url   : YARN ResourceManager REST API (recent apps only)
+#   3. --jhs-url  : Job History Server REST API (MapReduce only)
 #
 # Prerequisites:
-#   - kinit with a valid keytab before running
 #   - curl and jq installed
+#   - For RM/JHS: kinit with a valid keytab
+#   - For CM: admin credentials (prompted if --cm-user given without --cm-pass)
 #
 # Usage:
-#   ./yarn_apps_2_csv.sh --rm-url https://rm-host:8090 --out-access yarn_access.csv
-#   ./yarn_apps_2_csv.sh --rm-url https://rm-host:8090 --jhs-url https://jhs-host:19890 --out-access yarn_access.csv
-#   ./yarn_apps_2_csv.sh --rm-url https://rm-host:8090 --since 2025-01-01 --until 2026-03-11 --last-months 6
+#   # CM API (recommended -- gets full history):
+#   ./yarn_apps_2_csv.sh --cm-url https://cm-host:7183 --cm-user admin --since 2026-02-11
+#
+#   # RM + JHS (only recent apps in RM memory):
+#   ./yarn_apps_2_csv.sh --rm-url https://rm-host:8090 --jhs-url https://jhs-host:19890
+#
+#   # All sources combined:
+#   ./yarn_apps_2_csv.sh --cm-url https://cm-host:7183 --cm-user admin --rm-url https://rm-host:8090
 
 set -euo pipefail
 
+CM_URL=""
+CM_USER=""
+CM_PASS=""
+CM_CLUSTER=""
 RM_URL=""
 JHS_URL=""
 OUT_ACCESS="yarn_access.csv"
@@ -28,6 +41,10 @@ usage() {
     cat <<USAGE
 Usage: $0 [OPTIONS]
 
+  --cm-url         Cloudera Manager URL (e.g. https://cm-host:7183) -- best for history
+  --cm-user        CM admin username (will prompt for password)
+  --cm-pass        CM password (optional, prompted if omitted)
+  --cm-cluster     CM cluster name (auto-detected if omitted)
   --rm-url         YARN ResourceManager URL (e.g. https://rm-host:8090)
   --jhs-url        Job History Server URL (e.g. https://jhs-host:19890)
   --out-access     Output CSV (default: yarn_access.csv)
@@ -38,15 +55,19 @@ Usage: $0 [OPTIONS]
   --limit          Page size per request (default: 5000)
   --sleep          Sleep between requests in seconds (default: 0.1)
 
-At least one of --rm-url or --jhs-url is required.
+At least one of --cm-url, --rm-url, or --jhs-url is required.
 USAGE
     exit 1
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --rm-url)      RM_URL="$2";      shift 2 ;;
-        --jhs-url)     JHS_URL="$2";     shift 2 ;;
+        --cm-url)      CM_URL="$2";       shift 2 ;;
+        --cm-user)     CM_USER="$2";      shift 2 ;;
+        --cm-pass)     CM_PASS="$2";      shift 2 ;;
+        --cm-cluster)  CM_CLUSTER="$2";   shift 2 ;;
+        --rm-url)      RM_URL="$2";       shift 2 ;;
+        --jhs-url)     JHS_URL="$2";      shift 2 ;;
         --out-access)  OUT_ACCESS="$2";   shift 2 ;;
         --since)       SINCE="$2";        shift 2 ;;
         --until)       UNTIL="$2";        shift 2 ;;
@@ -59,10 +80,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$RM_URL" && -z "$JHS_URL" ]]; then
-    echo "ERROR: at least one of --rm-url or --jhs-url is required" >&2
+if [[ -z "$CM_URL" && -z "$RM_URL" && -z "$JHS_URL" ]]; then
+    echo "ERROR: at least one of --cm-url, --rm-url, or --jhs-url is required" >&2
     usage
 fi
+
+# Prompt for CM password if CM is used
+if [[ -n "$CM_URL" && -n "$CM_USER" && -z "$CM_PASS" ]]; then
+    read -rsp "Password for ${CM_USER}@${CM_URL}: " CM_PASS
+    echo >&2
+fi
+
+CM_URL="${CM_URL%/}"
 
 if ! command -v jq &>/dev/null; then
     echo "ERROR: jq is required. Install with: sudo yum install jq" >&2
@@ -136,6 +165,20 @@ else
     exit 1
 fi
 
+# ISO date strings for CM API
+if [[ -n "$SINCE" ]]; then
+    SINCE_ISO="${SINCE}T00:00:00.000Z"
+else
+    SINCE_ISO=$(epoch_ms_to_iso "$STARTED_BEGIN")
+fi
+if [[ -n "$UNTIL" ]]; then
+    UNTIL_ISO="${UNTIL}T23:59:59.999Z"
+elif [[ -n "$STARTED_END" ]]; then
+    UNTIL_ISO=$(epoch_ms_to_iso "$STARTED_END")
+else
+    UNTIL_ISO=""
+fi
+
 echo "[yarn] Date range: $(epoch_ms_to_date "$STARTED_BEGIN") to ${STARTED_END:+$(epoch_ms_to_date "$STARTED_END")}${STARTED_END:-now}" >&2
 
 # Write CSV header
@@ -145,6 +188,96 @@ SEEN_FILE=$(mktemp)
 RAW_FILE=$(mktemp)
 trap "rm -f $SEEN_FILE $RAW_FILE" EXIT
 TOTAL=0
+
+# ------------------------------------------------------------------ #
+#  Cloudera Manager API: /clusters/{cluster}/services/yarn/yarnApplications
+#  This has full history -- the best source for YARN app data.
+# ------------------------------------------------------------------ #
+
+JQ_CM_BATCH='
+.applications // [] | .[] |
+  [ (.startTime // ""),
+    "yarn",
+    (.user // ""),
+    (.pool // ""),
+    "",
+    (.name // ""),
+    "SUBMIT",
+    (.applicationType // "application"),
+    (.applicationId // ""),
+    "1"
+  ] | @csv
+'
+
+if [[ -n "$CM_URL" && -n "$CM_USER" ]]; then
+    echo "[yarn] Fetching from Cloudera Manager: ${CM_URL}" >&2
+
+    # Auto-detect cluster name if not provided
+    if [[ -z "$CM_CLUSTER" ]]; then
+        CM_CLUSTER=$(curl $CURL_OPTS -u "${CM_USER}:${CM_PASS}" \
+            "${CM_URL}/api/v33/clusters" 2>/dev/null | \
+            jq -r '.items[0].name // ""' 2>/dev/null)
+        if [[ -z "$CM_CLUSTER" ]]; then
+            echo "[yarn] ERROR: could not auto-detect cluster name. Use --cm-cluster" >&2
+        else
+            echo "[yarn] Auto-detected cluster: ${CM_CLUSTER}" >&2
+        fi
+    fi
+
+    if [[ -n "$CM_CLUSTER" ]]; then
+        CM_CLUSTER_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${CM_CLUSTER}', safe=''))" 2>/dev/null || echo "$CM_CLUSTER")
+
+        CM_OFFSET=0
+        CM_COUNT=0
+        CM_PAGE=0
+
+        while true; do
+            FILTER="from=${SINCE_ISO}"
+            if [[ -n "$UNTIL_ISO" ]]; then
+                FILTER="${FILTER};to=${UNTIL_ISO}"
+            fi
+
+            URL="${CM_URL}/api/v33/clusters/${CM_CLUSTER_ENC}/services/yarn/yarnApplications?filter=${FILTER}&limit=${LIMIT}&offset=${CM_OFFSET}"
+
+            RESPONSE=$(curl $CURL_OPTS -u "${CM_USER}:${CM_PASS}" "$URL" 2>/dev/null) || {
+                echo "[yarn] WARN: CM request failed at offset=${CM_OFFSET}" >&2
+                break
+            }
+
+            if [[ -z "$RESPONSE" || "$RESPONSE" == "null" ]]; then
+                break
+            fi
+
+            # Check for API error
+            ERR=$(echo "$RESPONSE" | jq -r '.message // ""' 2>/dev/null)
+            if [[ -n "$ERR" && "$ERR" != "" && "$ERR" != "null" ]]; then
+                echo "[yarn] ERROR: CM API: ${ERR}" >&2
+                break
+            fi
+
+            BATCH_COUNT=$(echo "$RESPONSE" | jq '.applications // [] | length' 2>/dev/null) || BATCH_COUNT=0
+            if [[ "$BATCH_COUNT" -eq 0 ]]; then
+                break
+            fi
+
+            echo "$RESPONSE" | jq -r "$JQ_CM_BATCH" 2>/dev/null >> "$RAW_FILE"
+
+            CM_COUNT=$((CM_COUNT + BATCH_COUNT))
+            CM_OFFSET=$((CM_OFFSET + BATCH_COUNT))
+            CM_PAGE=$((CM_PAGE + 1))
+
+            echo "[yarn] CM page=${CM_PAGE} fetched=${BATCH_COUNT} total=${CM_COUNT}" >&2
+
+            if [[ "$BATCH_COUNT" -lt "$LIMIT" ]]; then
+                break
+            fi
+
+            sleep "$SLEEP_SEC"
+        done
+
+        echo "[yarn] Cloudera Manager: ${CM_COUNT} apps fetched" >&2
+    fi
+fi
 
 # ------------------------------------------------------------------ #
 #  Batch jq: convert an entire page of RM apps to CSV in one call     #
