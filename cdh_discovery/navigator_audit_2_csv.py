@@ -4,14 +4,20 @@
 CDH 6.3.3 discovery. Python 3.6+ compatible.
 Bulk-export Cloudera Navigator audit events + metadata from MySQL databases.
 
-Audit DB -- daily-partitioned tables:
-  HIVE_AUDIT_EVENTS_YYYY_MM_DD   -- Hive/Impala queries (database, table, SQL)
-  HDFS_AUDIT_EVENTS_YYYY_MM_DD   -- HDFS file operations (~20M/day, aggregated)
-  HUE_AUDIT_EVENTS_YYYY_MM_DD    -- Hue web UI actions
+Audit DB -- auto-discovers all *_AUDIT_EVENTS_YYYY_MM_DD partition tables:
+  HIVE_AUDIT_EVENTS_*    -- Hive queries   (specialized: db.table detail)
+  HDFS_AUDIT_EVENTS_*    -- HDFS ops       (specialized: aggregated by user+op+path)
+  HUE_AUDIT_EVENTS_*     -- Hue actions    (generic extractor)
+  HBASE_AUDIT_EVENTS_*   -- HBase ops      (generic extractor)
+  IMPALA_AUDIT_EVENTS_*  -- Impala queries (generic extractor)
+  SENTRY_AUDIT_EVENTS_*  -- Sentry ops     (generic extractor)
+  ... any other service Navigator logs
+
+Use --services all (default) to extract everything, or comma-separated to pick.
 
 Metadata DB (optional, --meta-db-name):
-  NAV_HOURLYMETRICS              -- hourly activity counts per cluster
-  NAV_SOURCEINFO                 -- cluster service inventory
+  NAV_HOURLYMETRICS   -- hourly activity counts per cluster
+  NAV_SOURCEINFO      -- cluster service inventory
 
 Output:
   navigator_access.csv   -- audit events in dependency_access schema
@@ -106,7 +112,36 @@ def truncate_hdfs_path(path, depth=4):
 
 
 # ------------------------------------------------------------------ #
-#  HIVE audit extraction (full detail -- most valuable)              #
+#  Auto-discover service prefixes                                     #
+# ------------------------------------------------------------------ #
+
+def discover_service_prefixes(conn):
+    """Find all *_AUDIT_EVENTS_YYYY_MM_DD service prefixes in the database."""
+    pat = re.compile(r'^([A-Z_]+?)_AUDIT_EVENTS_\d{4}_\d{2}_\d{2}$', re.IGNORECASE)
+    prefixes = set()
+    with conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE '%\\_AUDIT\\_EVENTS\\_%'")
+        for row in cur:
+            tname = list(row.values())[0]
+            m = pat.match(tname)
+            if m:
+                prefixes.add(m.group(1).upper())
+    return sorted(prefixes)
+
+
+def get_table_columns(conn, table):
+    """Return the set of upper-cased column names for a table."""
+    cols = set()
+    with conn.cursor() as cur:
+        cur.execute("DESCRIBE `{}`".format(table))
+        for row in cur:
+            col = row.get("Field") or list(row.values())[0]
+            cols.add(col.upper())
+    return cols
+
+
+# ------------------------------------------------------------------ #
+#  HIVE audit extraction (specialized: rich db.table detail)          #
 # ------------------------------------------------------------------ #
 
 def extract_hive_day(conn, day_str, writer):
@@ -156,7 +191,7 @@ def extract_hive_day(conn, day_str, writer):
 
 
 # ------------------------------------------------------------------ #
-#  HDFS audit extraction (aggregated by user+op+path)                #
+#  HDFS audit extraction (specialized: aggregated by user+op+path)    #
 # ------------------------------------------------------------------ #
 
 def extract_hdfs_day(conn, day_str, hdfs_agg, path_depth):
@@ -207,39 +242,72 @@ def write_hdfs_aggregated(writer, hdfs_agg, since_str, until_str):
 
 
 # ------------------------------------------------------------------ #
-#  HUE audit extraction                                              #
+#  Generic audit extractor (works for any service)                    #
 # ------------------------------------------------------------------ #
 
-def extract_hue_day(conn, day_str, writer):
-    """Extract one day of HUE_AUDIT_EVENTS."""
-    table = "HUE_AUDIT_EVENTS_{}".format(day_str)
+_col_cache = {}
+
+def extract_generic_day(conn, service_prefix, day_str, writer):
+    """Extract one day of <SERVICE>_AUDIT_EVENTS using column auto-detection."""
+    table = "{}_AUDIT_EVENTS_{}".format(service_prefix, day_str)
     if not table_exists(conn, table):
         return 0
 
-    sql = """
-        SELECT EVENT_TIME, SERVICE_NAME, USERNAME, IMPERSONATOR,
-               IP_ADDR, OPERATION, SERVICE, OPERATION_TEXT, URL
-        FROM `{}`
-    """.format(table)
+    if service_prefix not in _col_cache:
+        _col_cache[service_prefix] = get_table_columns(conn, table)
+    cols = _col_cache[service_prefix]
+
+    sql = "SELECT * FROM `{}`".format(table)
+    svc_lower = service_prefix.lower()
 
     count = 0
     with conn.cursor() as cur:
         cur.execute(sql)
         for r in cur:
+            obj_id, obj_type = _derive_object(r, cols, svc_lower)
+            op_text = s(r.get("OPERATION_TEXT")) if "OPERATION_TEXT" in cols else ""
+
             writer.writerow({
                 "window_start": format_ts(r.get("EVENT_TIME")),
-                "service": "hue",
+                "service": svc_lower,
                 "user": s(r.get("USERNAME")),
-                "do_as": s(r.get("IMPERSONATOR")),
-                "client_ip": s(r.get("IP_ADDR")),
-                "app_name": s(r.get("OPERATION_TEXT"))[:200],
-                "op": s(r.get("OPERATION")).upper() or "ACCESS",
-                "object_type": s(r.get("SERVICE")).lower() or "hue",
-                "object_id": s(r.get("URL")) or "",
+                "do_as": s(r.get("IMPERSONATOR")) if "IMPERSONATOR" in cols else "",
+                "client_ip": s(r.get("IP_ADDR")) if "IP_ADDR" in cols else "",
+                "app_name": op_text[:200],
+                "op": s(r.get("OPERATION")).upper() if "OPERATION" in cols else "ACCESS",
+                "object_type": obj_type,
+                "object_id": obj_id,
                 "cnt": 1,
             })
             count += 1
     return count
+
+
+def _derive_object(row, cols, svc_lower):
+    """Derive object_type and object_id from whatever columns are available."""
+    if "DATABASE_NAME" in cols and "TABLE_NAME" in cols:
+        db = s(row.get("DATABASE_NAME"))
+        tbl = s(row.get("TABLE_NAME"))
+        if db and tbl:
+            return "{}.{}".format(db, tbl), s(row.get("OBJECT_TYPE", "")).lower() or "table"
+        if db:
+            return db, "database"
+        if tbl:
+            return tbl, "table"
+    elif "TABLE_NAME" in cols:
+        tbl = s(row.get("TABLE_NAME"))
+        family = s(row.get("FAMILY")) if "FAMILY" in cols else ""
+        qualifier = s(row.get("QUALIFIER")) if "QUALIFIER" in cols else ""
+        parts = [p for p in [tbl, family, qualifier] if p]
+        return ":".join(parts) if parts else "", "table"
+    if "SRC" in cols:
+        return s(row.get("SRC")) or "", "path"
+    if "URL" in cols:
+        svc_col = s(row.get("SERVICE")).lower() if "SERVICE" in cols else svc_lower
+        return s(row.get("URL")) or "", svc_col or svc_lower
+    if "RESOURCE_PATH" in cols:
+        return s(row.get("RESOURCE_PATH")) or "", "resource"
+    return "", svc_lower
 
 
 # ------------------------------------------------------------------ #
@@ -328,8 +396,8 @@ def main():
                     help="Start date YYYY-MM-DD (inclusive)")
     ap.add_argument("--until", default="",
                     help="End date YYYY-MM-DD (inclusive, default: today)")
-    ap.add_argument("--services", default="hive,hdfs,hue",
-                    help="Comma-separated audit services to extract (default: hive,hdfs,hue)")
+    ap.add_argument("--services", default="all",
+                    help="Comma-separated audit services, or 'all' to auto-discover (default: all)")
     ap.add_argument("--hdfs-path-depth", type=int, default=4,
                     help="Truncate HDFS paths to N levels for aggregation (default: 4)")
     ap.add_argument("--out-access", default="navigator_access.csv")
@@ -347,9 +415,7 @@ def main():
     else:
         until = dt.date.today()
 
-    audit_services = set(svc.strip().lower() for svc in args.services.split(","))
     print("{} Date range: {} to {}".format(LOG, since, until), file=sys.stderr)
-    print("{} Audit services: {}".format(LOG, audit_services), file=sys.stderr)
 
     out_dir = os.path.dirname(os.path.abspath(args.out_access))
     if out_dir and not os.path.exists(out_dir):
@@ -361,9 +427,24 @@ def main():
     conn = get_connection(args.db_host, args.db_port, args.db_name,
                           args.db_user, args.db_password)
 
-    total_hive = 0
-    total_hdfs_raw = 0
-    total_hue = 0
+    # Auto-discover available service prefixes
+    all_prefixes = discover_service_prefixes(conn)
+    print("{} Discovered service prefixes: {}".format(
+        LOG, ", ".join(all_prefixes) or "(none)"), file=sys.stderr)
+
+    if args.services.strip().lower() == "all":
+        requested = set(p.lower() for p in all_prefixes)
+    else:
+        requested = set(svc.strip().lower() for svc in args.services.split(","))
+
+    print("{} Extracting services: {}".format(
+        LOG, ", ".join(sorted(requested))), file=sys.stderr)
+
+    # HIVE and HDFS get specialized extractors; everything else goes generic
+    generic_services = sorted(requested - {"hive", "hdfs"})
+
+    totals = defaultdict(int)
+    hdfs_raw_total = 0
     hdfs_agg = defaultdict(int)
 
     with open(args.out_access, "w", newline="") as f:
@@ -374,39 +455,48 @@ def main():
             day_str = day.strftime("%Y_%m_%d")
             day_display = day.strftime("%Y-%m-%d")
 
-            if "hive" in audit_services:
+            if "hive" in requested:
                 n = extract_hive_day(conn, day_str, writer)
-                total_hive += n
+                totals["hive"] += n
                 if n > 0:
                     print("{} {} HIVE: {:,} events (total: {:,})".format(
-                        LOG, day_display, n, total_hive), file=sys.stderr)
+                        LOG, day_display, n, totals["hive"]), file=sys.stderr)
 
-            if "hdfs" in audit_services:
+            if "hdfs" in requested:
                 n = extract_hdfs_day(conn, day_str, hdfs_agg, args.hdfs_path_depth)
-                total_hdfs_raw += n
+                hdfs_raw_total += n
                 if n > 0:
                     print("{} {} HDFS: {:,} raw events (agg keys: {:,})".format(
                         LOG, day_display, n, len(hdfs_agg)), file=sys.stderr)
 
-            if "hue" in audit_services:
-                n = extract_hue_day(conn, day_str, writer)
-                total_hue += n
+            for svc in generic_services:
+                svc_upper = svc.upper()
+                if svc_upper not in [p.upper() for p in all_prefixes]:
+                    continue
+                n = extract_generic_day(conn, svc_upper, day_str, writer)
+                totals[svc] += n
+                if n > 0:
+                    print("{} {} {}: {:,} events (total: {:,})".format(
+                        LOG, day_display, svc_upper, n, totals[svc]), file=sys.stderr)
 
         if hdfs_agg:
             hdfs_written = write_hdfs_aggregated(
                 writer, hdfs_agg,
                 since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d"))
+            totals["hdfs"] = len(hdfs_agg)
             print("{} HDFS aggregated: {:,} raw -> {:,} unique user+op+path rows".format(
-                LOG, total_hdfs_raw, hdfs_written), file=sys.stderr)
+                LOG, hdfs_raw_total, hdfs_written), file=sys.stderr)
 
     conn.close()
 
-    total_access = total_hive + len(hdfs_agg) + total_hue
-    print("{} Wrote {:,} access rows to {}".format(LOG, total_access, args.out_access), file=sys.stderr)
-    print("{}   Hive:  {:,} detail rows".format(LOG, total_hive), file=sys.stderr)
-    print("{}   HDFS:  {:,} aggregated rows (from {:,} raw)".format(
-        LOG, len(hdfs_agg), total_hdfs_raw), file=sys.stderr)
-    print("{}   Hue:   {:,} detail rows".format(LOG, total_hue), file=sys.stderr)
+    total_access = sum(totals.values())
+    print("{} Wrote {:,} total access rows to {}".format(
+        LOG, total_access, args.out_access), file=sys.stderr)
+    for svc in sorted(totals):
+        label = "aggregated" if svc == "hdfs" else "detail"
+        extra = " (from {:,} raw)".format(hdfs_raw_total) if svc == "hdfs" else ""
+        print("{}   {:12s} {:>10,} {} rows{}".format(
+            LOG, svc, totals[svc], label, extra), file=sys.stderr)
 
     # ---------------------------------------------------------- #
     #  2. Metadata DB extraction (optional)                       #
