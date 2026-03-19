@@ -19,8 +19,8 @@ OUT_ACCESS="yarn_access.csv"
 SINCE=""
 UNTIL=""
 LAST_MONTHS=3
-LIMIT=1000
-SLEEP_SEC=0.2
+LIMIT=5000
+SLEEP_SEC=0.1
 CURL_OPTS="-s -k"
 STATES="FINISHED,KILLED,FAILED,RUNNING"
 
@@ -35,8 +35,8 @@ Usage: $0 [OPTIONS]
   --until          End date YYYY-MM-DD (optional)
   --last-months    If --since/--until not given, fetch last N months (default: 3)
   --states         App states for RM query (default: FINISHED,KILLED,FAILED,RUNNING)
-  --limit          Page size per request (default: 1000)
-  --sleep          Sleep between requests in seconds (default: 0.2)
+  --limit          Page size per request (default: 5000)
+  --sleep          Sleep between requests in seconds (default: 0.1)
 
 At least one of --rm-url or --jhs-url is required.
 USAGE
@@ -142,8 +142,46 @@ echo "[yarn] Date range: $(epoch_ms_to_date "$STARTED_BEGIN") to ${STARTED_END:+
 echo "window_start,service,user,do_as,client_ip,app_name,op,object_type,object_id,cnt" > "$OUT_ACCESS"
 
 SEEN_FILE=$(mktemp)
-trap "rm -f $SEEN_FILE" EXIT
+RAW_FILE=$(mktemp)
+trap "rm -f $SEEN_FILE $RAW_FILE" EXIT
 TOTAL=0
+
+# ------------------------------------------------------------------ #
+#  Batch jq: convert an entire page of RM apps to CSV in one call     #
+# ------------------------------------------------------------------ #
+JQ_RM_BATCH='
+.apps.app // [] | .[] |
+  (.startedTime // 0) as $ts |
+  ($ts / 1000 | floor | strftime("%Y-%m-%dT%H:%M:%SZ")) as $iso |
+  [ $iso, "yarn", (.user // ""), "", "",
+    (.name // ""), "SUBMIT", (.applicationType // "application"),
+    (.id // ""), "1",
+    ($ts | tostring),
+    (.queue // ""), (.finalStatus // .state // "")
+  ] | @csv
+'
+
+# Batch jq: convert an entire page of JHS jobs to CSV in one call
+JQ_JHS_BATCH='
+.jobs.job // [] | .[] |
+  ((.startTime // .submitTime // 0)) as $ts |
+  ($ts / 1000 | floor | strftime("%Y-%m-%dT%H:%M:%SZ")) as $iso |
+  (.id // "" | gsub("^job_"; "application_")) as $appid |
+  [ $iso, "yarn", (.user // ""), "", "",
+    (.name // ""), "SUBMIT", "mapreduce",
+    $appid, "1",
+    ($ts | tostring),
+    "", ""
+  ] | @csv
+'
+
+# Extract max startedTime from RM response
+JQ_RM_MAX='.apps.app // [] | [.[].startedTime // 0] | max'
+JQ_JHS_MAX='.jobs.job // [] | [.[]|(.startTime // .submitTime // 0)] | max'
+
+# Count apps in response
+JQ_RM_COUNT='.apps.app // [] | length'
+JQ_JHS_COUNT='.jobs.job // [] | length'
 
 # ------------------------------------------------------------------ #
 #  ResourceManager: /ws/v1/cluster/apps                               #
@@ -172,40 +210,16 @@ if [[ -n "$RM_URL" ]]; then
             break
         fi
 
-        APPS=$(echo "$RESPONSE" | jq -c '.apps.app // []' 2>/dev/null)
-        COUNT=$(echo "$APPS" | jq 'length' 2>/dev/null) || COUNT=0
-
+        COUNT=$(echo "$RESPONSE" | jq "$JQ_RM_COUNT" 2>/dev/null) || COUNT=0
         if [[ "$COUNT" -eq 0 ]]; then
             break
         fi
 
-        MAX_TS=0
-        NEW=0
+        # Single jq call to transform entire page to CSV rows
+        echo "$RESPONSE" | jq -r "$JQ_RM_BATCH" 2>/dev/null >> "$RAW_FILE"
 
-        echo "$APPS" | jq -c '.[]' 2>/dev/null | while IFS= read -r APP; do
-            APP_ID=$(echo "$APP" | jq -r '.id // ""')
-            [[ -z "$APP_ID" ]] && continue
-
-            if grep -qF "$APP_ID" "$SEEN_FILE" 2>/dev/null; then
-                continue
-            fi
-            echo "$APP_ID" >> "$SEEN_FILE"
-
-            APP_USER=$(echo "$APP" | jq -r '.user // ""')
-            APP_NAME=$(echo "$APP" | jq -r '.name // ""')
-            STARTED_TIME=$(echo "$APP" | jq -r '.startedTime // 0')
-            APP_TYPE=$(echo "$APP" | jq -r '.applicationType // ""')
-            QUEUE=$(echo "$APP" | jq -r '.queue // ""')
-            STATE=$(echo "$APP" | jq -r '.finalStatus // .state // ""')
-
-            ISO_TIME=$(epoch_ms_to_iso "$STARTED_TIME")
-            APP_NAME_CSV=$(csv_escape "$APP_NAME")
-
-            echo "${ISO_TIME},yarn,${APP_USER},,,${APP_NAME_CSV},SUBMIT,application,${APP_ID},1" >> "$OUT_ACCESS"
-        done
-
-        MAX_TS=$(echo "$APPS" | jq '[.[].startedTime // 0] | max' 2>/dev/null) || MAX_TS=0
-        RM_COUNT=$(wc -l < "$SEEN_FILE" | tr -d ' ')
+        MAX_TS=$(echo "$RESPONSE" | jq "$JQ_RM_MAX" 2>/dev/null) || MAX_TS=0
+        RM_COUNT=$((RM_COUNT + COUNT))
         PAGE=$((PAGE + 1))
 
         echo "[yarn] RM page=${PAGE} fetched=${COUNT} total=${RM_COUNT} cursor=$(epoch_ms_to_date "${CURSOR:-0}")" >&2
@@ -230,8 +244,7 @@ if [[ -n "$RM_URL" ]]; then
         sleep "$SLEEP_SEC"
     done
 
-    RM_COUNT=$(wc -l < "$SEEN_FILE" | tr -d ' ')
-    echo "[yarn] ResourceManager: ${RM_COUNT} unique apps" >&2
+    echo "[yarn] ResourceManager: ${RM_COUNT} apps fetched" >&2
 fi
 
 # ------------------------------------------------------------------ #
@@ -261,42 +274,18 @@ if [[ -n "$JHS_URL" ]]; then
             break
         fi
 
-        JOBS=$(echo "$RESPONSE" | jq -c '.jobs.job // []' 2>/dev/null)
-        COUNT=$(echo "$JOBS" | jq 'length' 2>/dev/null) || COUNT=0
-
+        COUNT=$(echo "$RESPONSE" | jq "$JQ_JHS_COUNT" 2>/dev/null) || COUNT=0
         if [[ "$COUNT" -eq 0 ]]; then
             break
         fi
 
-        MAX_TS=0
+        echo "$RESPONSE" | jq -r "$JQ_JHS_BATCH" 2>/dev/null >> "$RAW_FILE"
 
-        echo "$JOBS" | jq -c '.[]' 2>/dev/null | while IFS= read -r JOB; do
-            JOB_ID=$(echo "$JOB" | jq -r '.id // ""')
-            [[ -z "$JOB_ID" ]] && continue
-
-            # Convert job_xxx to application_xxx for dedup with RM
-            APP_ID="${JOB_ID/job_/application_}"
-
-            if grep -qF "$APP_ID" "$SEEN_FILE" 2>/dev/null; then
-                continue
-            fi
-            echo "$APP_ID" >> "$SEEN_FILE"
-
-            JOB_USER=$(echo "$JOB" | jq -r '.user // ""')
-            JOB_NAME=$(echo "$JOB" | jq -r '.name // ""')
-            START_TIME=$(echo "$JOB" | jq -r '.startTime // .submitTime // 0')
-
-            ISO_TIME=$(epoch_ms_to_iso "$START_TIME")
-            JOB_NAME_CSV=$(csv_escape "$JOB_NAME")
-
-            echo "${ISO_TIME},yarn,${JOB_USER},,,${JOB_NAME_CSV},SUBMIT,application,${APP_ID},1" >> "$OUT_ACCESS"
-        done
-
-        MAX_TS=$(echo "$JOBS" | jq '[.[].startTime // .[].submitTime // 0] | max' 2>/dev/null) || MAX_TS=0
-        TOTAL_NOW=$(wc -l < "$SEEN_FILE" | tr -d ' ')
+        MAX_TS=$(echo "$RESPONSE" | jq "$JQ_JHS_MAX" 2>/dev/null) || MAX_TS=0
+        JHS_COUNT=$((JHS_COUNT + COUNT))
         PAGE=$((PAGE + 1))
 
-        echo "[yarn] JHS page=${PAGE} fetched=${COUNT} total=${TOTAL_NOW}" >&2
+        echo "[yarn] JHS page=${PAGE} fetched=${COUNT} total=${JHS_COUNT}" >&2
 
         if [[ "$COUNT" -lt "$LIMIT" ]]; then
             break
@@ -318,10 +307,19 @@ if [[ -n "$JHS_URL" ]]; then
         sleep "$SLEEP_SEC"
     done
 
-    TOTAL_NOW=$(wc -l < "$SEEN_FILE" | tr -d ' ')
-    JHS_NEW=$((TOTAL_NOW - ${RM_COUNT:-0}))
-    echo "[yarn] Job History Server: ${JHS_NEW} new jobs" >&2
+    echo "[yarn] Job History Server: ${JHS_COUNT} jobs fetched" >&2
 fi
 
-TOTAL=$(wc -l < "$SEEN_FILE" | tr -d ' ')
-echo "[yarn] Done. Wrote ${TOTAL} rows to ${OUT_ACCESS}" >&2
+# ------------------------------------------------------------------ #
+#  Dedup by app-id (column 9) and write final CSV                     #
+# ------------------------------------------------------------------ #
+# Raw file has 13 columns (10 CSV + startedTime, queue, status as extras)
+# Dedup on column 9 (app id), keep first occurrence, output columns 1-10
+if [[ -f "$RAW_FILE" && -s "$RAW_FILE" ]]; then
+    awk -F',' '!seen[$9]++ { print }' "$RAW_FILE" | \
+        cut -d',' -f1-10 >> "$OUT_ACCESS"
+fi
+
+TOTAL=$(( $(wc -l < "$OUT_ACCESS" | tr -d ' ') - 1 ))
+[[ "$TOTAL" -lt 0 ]] && TOTAL=0
+echo "[yarn] Done. Wrote ${TOTAL} unique rows to ${OUT_ACCESS}" >&2
