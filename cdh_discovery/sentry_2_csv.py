@@ -106,52 +106,150 @@ def fetch_roles(conn, args):
 
 
 def fetch_privileges(conn, args):
-    """Fetch grant privileges if table exists. Returns list of dicts."""
-    cur = conn.cursor()
+    """Fetch grant privileges joined with role-privilege mapping.
+
+    Sentry stores privileges in SENTRY_DB_PRIVILEGE and links them to roles
+    via SENTRY_ROLE_DB_PRIVILEGE_MAP (ROLE_ID, DB_PRIVILEGE_ID).
+    """
+    priv_table = args.privilege_table
+    map_table = "SENTRY_ROLE_DB_PRIVILEGE_MAP"
+
     if args.db_type == "postgres":
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute(
-            'SELECT * FROM "{priv_table}"'.format(priv_table=args.privilege_table)
-            if args.db_type == "postgres"
-            else "SELECT * FROM `{priv_table}`".format(priv_table=args.privilege_table)
-        )
-        rows = cur.fetchall()
-    except Exception as e:
-        print("WARN: could not read privilege table '{}': {}".format(args.privilege_table, e), file=sys.stderr)
-        return []
-    finally:
-        cur.close()
+        queries = [
+            '''SELECT r."ROLE_NAME" AS role_name, p.*
+                 FROM "{priv}" p
+                 JOIN "{map}" m ON m."DB_PRIVILEGE_ID" = p."DB_PRIVILEGE_ID"
+                 JOIN "SENTRY_ROLE" r ON r."ROLE_ID" = m."ROLE_ID"'''.format(priv=priv_table, map=map_table),
+            'SELECT * FROM "{priv}"'.format(priv=priv_table),
+        ]
+    else:
+        queries = [
+            """SELECT r.ROLE_NAME AS role_name, p.*
+                 FROM `{priv}` p
+                 JOIN `{map}` m ON m.DB_PRIVILEGE_ID = p.DB_PRIVILEGE_ID
+                 JOIN `SENTRY_ROLE` r ON r.ROLE_ID = m.ROLE_ID""".format(priv=priv_table, map=map_table),
+            "SELECT * FROM `{priv}`".format(priv=priv_table),
+        ]
 
-    return [dict(row) for row in rows]
-
-
-def fetch_role_user_group(conn, args):
-    """Fetch role-user and role-group mappings if tables exist."""
-    result = []  # list of (role_id, principal_type, principal_name)
-    # Default Sentry table names (CDH / Apache Sentry)
-    group_table = args.role_group_table or "SENTRY_ROLE_GROUP_MAP"
-    user_table = args.role_user_table or "SENTRY_ROLE_USER_MAP"
-    for table, principal in [(user_table, "user"), (group_table, "group")]:
+    for q in queries:
         cur = conn.cursor()
         if args.db_type == "postgres":
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
-            q = 'SELECT * FROM "{}"'.format(table) if args.db_type == "postgres" else "SELECT * FROM `{}`".format(table)
             cur.execute(q)
             rows = cur.fetchall()
+            result = [dict(row) for row in rows]
+            print("[cdh_sentry] {} privilege rows".format(len(result)), file=sys.stderr)
+            return result
         except Exception as e:
-            print("WARN: could not read {} table '{}': {}".format(principal, table, e), file=sys.stderr)
+            print("[cdh_sentry] privilege query fallback: {}".format(e), file=sys.stderr)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             continue
         finally:
             cur.close()
 
-        for r in rows:
-            d = dict(r) if not isinstance(r, dict) else r
-            role_id = d.get("ROLE_ID") or d.get("role_id")
-            name = d.get("USER_NAME") or d.get("user_name") or d.get("GROUP_NAME") or d.get("group_name") or ""
-            if role_id is not None and name:
-                result.append((str(role_id), principal, name))
+    return []
+
+
+def fetch_role_user_group(conn, args):
+    """Fetch role-user and role-group mappings via JOINs.
+
+    Sentry schema uses ID foreign keys (GROUP_ID, USER_ID) in the mapping
+    tables, so we JOIN with SENTRY_GROUP / SENTRY_USER to get the names.
+    """
+    result = []  # list of (role_id, principal_type, principal_name)
+    group_map_table = args.role_group_table or "SENTRY_ROLE_GROUP_MAP"
+    user_map_table  = args.role_user_table or "SENTRY_ROLE_USER_MAP"
+
+    # --- groups: JOIN mapping -> SENTRY_GROUP to resolve GROUP_ID -> GROUP_NAME ---
+    queries_group = []
+    if args.db_type == "postgres":
+        queries_group = [
+            # Try joined query first
+            '''SELECT m."ROLE_ID", g."GROUP_NAME"
+                 FROM "{map}" m
+                 JOIN "SENTRY_GROUP" g ON g."GROUP_ID" = m."GROUP_ID"'''.format(map=group_map_table),
+            # Fallback: maybe GROUP_NAME is directly in the mapping table
+            'SELECT "ROLE_ID", "GROUP_NAME" FROM "{}"'.format(group_map_table),
+        ]
+    else:
+        queries_group = [
+            """SELECT m.ROLE_ID, g.GROUP_NAME
+                 FROM `{map}` m
+                 JOIN `SENTRY_GROUP` g ON g.GROUP_ID = m.GROUP_ID""".format(map=group_map_table),
+            "SELECT ROLE_ID, GROUP_NAME FROM `{}`".format(group_map_table),
+        ]
+
+    for q in queries_group:
+        cur = conn.cursor()
+        if args.db_type == "postgres":
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(q)
+            rows = cur.fetchall()
+            for r in rows:
+                d = dict(r) if not isinstance(r, dict) else r
+                role_id = d.get("ROLE_ID") or d.get("role_id")
+                name = d.get("GROUP_NAME") or d.get("group_name") or ""
+                if role_id is not None and name:
+                    result.append((str(role_id), "group", name))
+            print("[cdh_sentry] {} group mappings from {}".format(len(rows), group_map_table), file=sys.stderr)
+            break
+        except Exception as e:
+            print("[cdh_sentry] group query fallback ({}): {}".format(group_map_table, e), file=sys.stderr)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            continue
+        finally:
+            cur.close()
+
+    # --- users: JOIN mapping -> SENTRY_USER to resolve USER_ID -> USER_NAME ---
+    queries_user = []
+    if args.db_type == "postgres":
+        queries_user = [
+            '''SELECT m."ROLE_ID", u."USER_NAME"
+                 FROM "{map}" m
+                 JOIN "SENTRY_USER" u ON u."USER_ID" = m."USER_ID"'''.format(map=user_map_table),
+            'SELECT "ROLE_ID", "USER_NAME" FROM "{}"'.format(user_map_table),
+        ]
+    else:
+        queries_user = [
+            """SELECT m.ROLE_ID, u.USER_NAME
+                 FROM `{map}` m
+                 JOIN `SENTRY_USER` u ON u.USER_ID = m.USER_ID""".format(map=user_map_table),
+            "SELECT ROLE_ID, USER_NAME FROM `{}`".format(user_map_table),
+        ]
+
+    for q in queries_user:
+        cur = conn.cursor()
+        if args.db_type == "postgres":
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(q)
+            rows = cur.fetchall()
+            for r in rows:
+                d = dict(r) if not isinstance(r, dict) else r
+                role_id = d.get("ROLE_ID") or d.get("role_id")
+                name = d.get("USER_NAME") or d.get("user_name") or ""
+                if role_id is not None and name:
+                    result.append((str(role_id), "user", name))
+            print("[cdh_sentry] {} user mappings from {}".format(len(rows), user_map_table), file=sys.stderr)
+            break
+        except Exception as e:
+            print("[cdh_sentry] user query fallback ({}): {}".format(user_map_table, e), file=sys.stderr)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            continue
+        finally:
+            cur.close()
+
     return result
 
 
@@ -209,25 +307,59 @@ def main():
                     "extra": "role_id={}".format(r["role_id"]),
                 })
 
-        # Privileges: optional second table for DB/table/URI objects
+        # Privileges: JOIN privilege -> role mapping for richer output
         privs = fetch_privileges(conn, args)
+        priv_access_rows = []
         if privs:
             with open(args.out_objects, "a", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=OBJECT_FIELDS)
+                seen_targets = set()
                 for p in privs:
-                    obj_id = (p.get("DB_NAME") or p.get("db_name") or "") + "." + (p.get("TABLE_NAME") or p.get("table_name") or "")
-                    if not obj_id.strip("."):
-                        obj_id = p.get("URI") or p.get("uri") or p.get("SERVER_NAME") or p.get("server_name") or "privilege"
-                    w.writerow({
-                        "service": "sentry",
-                        "object_type": "privilege_target",
-                        "object_id": obj_id.strip(".") or "privilege",
-                        "owner": "",
-                        "group": "",
-                        "extra": "scope={}".format(p.get("PRIVILEGE_SCOPE") or p.get("privilege_scope") or ""),
-                    })
+                    db_name = (p.get("DB_NAME") or p.get("db_name") or "").strip()
+                    tbl_name = (p.get("TABLE_NAME") or p.get("table_name") or "").strip()
+                    uri = (p.get("URI") or p.get("uri") or "").strip()
+                    server = (p.get("SERVER_NAME") or p.get("server_name") or "").strip()
+                    action = (p.get("ACTION") or p.get("action") or "").strip()
+                    scope = (p.get("PRIVILEGE_SCOPE") or p.get("privilege_scope") or "").strip()
+                    role_name = (p.get("role_name") or "").strip()
 
-        # Access: role–principal (user/group) and optionally role–privilege
+                    if db_name and tbl_name:
+                        obj_id = "{}.{}".format(db_name, tbl_name)
+                    elif db_name:
+                        obj_id = db_name
+                    elif uri:
+                        obj_id = uri
+                    elif server:
+                        obj_id = server
+                    else:
+                        obj_id = "privilege"
+
+                    if obj_id not in seen_targets:
+                        seen_targets.add(obj_id)
+                        w.writerow({
+                            "service": "sentry",
+                            "object_type": "privilege_target",
+                            "object_id": obj_id,
+                            "owner": "",
+                            "group": "",
+                            "extra": "scope={}".format(scope),
+                        })
+
+                    if role_name:
+                        priv_access_rows.append({
+                            "window_start": "",
+                            "service": "sentry",
+                            "user": role_name,
+                            "do_as": "",
+                            "client_ip": "",
+                            "app_name": "role",
+                            "op": action.upper() or "ALL",
+                            "object_type": "privilege_target",
+                            "object_id": obj_id,
+                            "cnt": 1,
+                        })
+
+        # Access: role–principal (user/group) + role–privilege grants
         role_principals = fetch_role_user_group(conn, args)
         with open(args.out_access, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=ACCESS_FIELDS)
@@ -237,17 +369,23 @@ def main():
                 w.writerow({
                     "window_start": "",
                     "service": "sentry",
-                    "user": principal_name if principal_type == "user" else "",
+                    "user": principal_name,
                     "do_as": "",
                     "client_ip": "",
-                    "app_name": "",
+                    "app_name": principal_type,
                     "op": "GRANT_ROLE",
                     "object_type": "role",
                     "object_id": role_name,
                     "cnt": 1,
                 })
-        print("[cdh_sentry] Wrote {} roles to {}, {} access rows to {}".format(
-            len(roles), args.out_objects, len(role_principals), args.out_access), file=sys.stderr)
+            for row in priv_access_rows:
+                w.writerow(row)
+
+        total_access = len(role_principals) + len(priv_access_rows)
+        print("[cdh_sentry] Wrote {} roles + {} privilege targets to {}".format(
+            len(roles), len(privs), args.out_objects), file=sys.stderr)
+        print("[cdh_sentry] Wrote {} access rows ({} principal grants + {} privilege grants) to {}".format(
+            total_access, len(role_principals), len(priv_access_rows), args.out_access), file=sys.stderr)
     finally:
         conn.close()
 
