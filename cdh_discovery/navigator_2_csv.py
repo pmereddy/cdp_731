@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 CDH 6.3.3 discovery. Python 3.6+ compatible.
-Exports Cloudera Navigator metadata to CSV for dependency modeling and Neo4j load.
+Authentication modes (--auth-mode):
+  cookie   - Pass a browser session cookie string (default, most reliable)
+  login    - Authenticate via form login (j_spring_security_check) to get a cookie
+  basic    - HTTP Basic auth (may not work if Navigator uses form-based auth)
 
-Uses the Navigator REST API v3 (HTTP Basic auth). Produces:
-  - navigator_objects.csv  -- entities (HDFS paths, Hive tables, etc.) in dependency_objects schema
-  - navigator_access.csv   -- audit events in dependency_access schema (for access graph)
-  - navigator_lineage.csv  -- relations/lineage edges (from_object_id, to_object_id, relation)
-    compatible with atlas_2_csv lineage format for load_neo4j.
+Produces:
+  - navigator_objects.csv  -- entities (HDFS paths, Hive tables, etc.)
+  - navigator_access.csv   -- audit events
+  - navigator_lineage.csv  -- relations/lineage edges
 
 Endpoints used:
   GET /api/v3/entities?query=...&limit=&offset=
@@ -20,10 +22,11 @@ from __future__ import print_function
 
 import argparse
 import csv
+import getpass
 import os
 import sys
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 try:
     import requests
@@ -228,10 +231,15 @@ def main():
         description="CDH discovery: export Cloudera Navigator entities, audits, and lineage to CSV."
     )
     ap.add_argument("--base-url", required=True,
-                    help="Navigator API base URL (e.g. http://navigator-host:7187/api/v3)")
-    ap.add_argument("--user", default="admin", help="Navigator API user (default: admin)")
+                    help="Navigator API base URL (e.g. https://navigator-host:7187/api/v3)")
+    ap.add_argument("--auth-mode", choices=["cookie", "login", "basic"], default="cookie",
+                    help="Authentication mode (default: cookie)")
+    ap.add_argument("--cookie", default="",
+                    help="Browser cookie string for cookie auth (e.g. 'JSESSIONID=abc123'). "
+                         "Copy from browser DevTools -> Network -> Request Headers -> Cookie")
+    ap.add_argument("--user", default="", help="Username for login/basic auth")
     ap.add_argument("--password", default="",
-                    help="Navigator API password (required unless empty)")
+                    help="Password for login/basic auth (leave empty to be prompted)")
     ap.add_argument("--verify-tls", action="store_true", default=False,
                     help="Verify TLS certificates")
     ap.add_argument("--entity-types", default="FILE,DIRECTORY,TABLE,VIEW,DATABASE,KUDU_TABLE",
@@ -269,9 +277,47 @@ def main():
 
     session = requests.Session()
     session.verify = args.verify_tls
-    session.auth = (args.user, args.password)
-    session.headers.setdefault("Content-Type", "application/json")
     base_url = args.base_url.rstrip("/")
+
+    # Derive the Navigator root URL from base_url (strip /api/vN)
+    nav_root = base_url
+    for suffix in ("/api/v3", "/api/v9", "/api/v13", "/api"):
+        if nav_root.endswith(suffix):
+            nav_root = nav_root[:-len(suffix)]
+            break
+
+    if args.auth_mode == "cookie":
+        if not args.cookie:
+            args.cookie = getpass.getpass(
+                "Paste browser cookie string (DevTools -> Network -> Cookie header): ")
+        session.headers["Cookie"] = args.cookie
+        print("[navigator] Using cookie auth", file=sys.stderr)
+
+    elif args.auth_mode == "login":
+        if not args.user:
+            args.user = input("Navigator username: ")
+        if not args.password:
+            args.password = getpass.getpass("Password for {}: ".format(args.user))
+        login_url = "{}/j_spring_security_check".format(nav_root)
+        resp = session.post(login_url, data={
+            "j_username": args.user,
+            "j_password": args.password,
+        }, allow_redirects=False)
+        if resp.status_code in (200, 302):
+            print("[navigator] Login successful (HTTP {})".format(resp.status_code), file=sys.stderr)
+        else:
+            print("[navigator] Login may have failed (HTTP {}). Trying anyway...".format(
+                resp.status_code), file=sys.stderr)
+
+    elif args.auth_mode == "basic":
+        if not args.user:
+            args.user = input("Navigator username: ")
+        if not args.password:
+            args.password = getpass.getpass("Password for {}: ".format(args.user))
+        session.auth = (args.user, args.password)
+        print("[navigator] Using basic auth", file=sys.stderr)
+
+    session.headers.setdefault("Content-Type", "application/json")
 
     entity_types = [t.strip().upper() for t in args.entity_types.split(",") if t.strip()]
     out_dir = os.path.dirname(os.path.abspath(args.out_objects))
