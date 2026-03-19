@@ -53,7 +53,7 @@ LINEAGE_FIELDS = [
 ]
 
 # ------------------------------------------------------------------ #
-# Oozie DB tables queried:
+# Oozie DB tables queried (column = "status", not "status_str"):
 #   WF_JOBS       - workflow definitions / runs
 #   COORD_JOBS    - coordinator definitions / runs
 #   BUNDLE_JOBS   - bundle definitions / runs
@@ -146,7 +146,7 @@ def fetch_rows(conn, db_type, sql_mysql, sql_postgres, batch_size):
 #  Job-level queries                                                  #
 # ------------------------------------------------------------------ #
 
-JOB_COLS = "id, app_name, app_path, user_name, group_name, status_str, created_time, start_time, end_time"
+JOB_COLS = "id, app_name, app_path, user_name, group_name, status, created_time, start_time, end_time"
 
 def job_sql_mysql(table):
     return "SELECT {cols} FROM {t} ORDER BY created_time DESC".format(cols=JOB_COLS, t=table)
@@ -164,7 +164,7 @@ WF_ACTIONS_MYSQL = """
            a.wf_id         AS wf_id,
            a.name          AS action_name,
            a.type          AS action_type,
-           a.status_str    AS status,
+           a.status        AS status,
            a.external_id   AS external_id,
            a.tracker_uri   AS tracker_uri,
            a.created_time  AS created_time,
@@ -180,7 +180,7 @@ WF_ACTIONS_POSTGRES = """
            a.wf_id         AS wf_id,
            a.name          AS action_name,
            a.type          AS action_type,
-           a.status_str    AS status,
+           a.status        AS status,
            a.external_id   AS external_id,
            a.tracker_uri   AS tracker_uri,
            a.created_time  AS created_time,
@@ -295,7 +295,7 @@ def main():
                     app_path = s(r.get("app_path"))
                     user     = s(r.get("user_name"))
                     group    = s(r.get("group_name"))
-                    status   = s(r.get("status_str"))
+                    status   = s(r.get("status"))
                     created  = format_ts(r.get("created_time"))
 
                     obj_id = app_path.rstrip("/") if app_path else job_id
