@@ -32,7 +32,7 @@ OUT_ACCESS="yarn_access.csv"
 SINCE=""
 UNTIL=""
 LAST_MONTHS=3
-LIMIT=5000
+LIMIT=1000
 SLEEP_SEC=0.1
 CURL_OPTS="-s -k"
 STATES="FINISHED,KILLED,FAILED,RUNNING"
@@ -52,7 +52,7 @@ Usage: $0 [OPTIONS]
   --until          End date YYYY-MM-DD (optional)
   --last-months    If --since/--until not given, fetch last N months (default: 3)
   --states         App states for RM query (default: FINISHED,KILLED,FAILED,RUNNING)
-  --limit          Page size per request (default: 5000)
+  --limit          Page size per request (default: 1000, CM max is 1000)
   --sleep          Sleep between requests in seconds (default: 0.1)
 
 At least one of --cm-url, --rm-url, or --jhs-url is required.
@@ -232,12 +232,10 @@ if [[ -n "$CM_URL" && -n "$CM_USER" ]]; then
         CM_PAGE=0
 
         while true; do
-            FILTER="from=${SINCE_ISO}"
+            URL="${CM_URL}/api/v33/clusters/${CM_CLUSTER_ENC}/services/yarn/yarnApplications?limit=${LIMIT}&offset=${CM_OFFSET}&from=${SINCE_ISO}"
             if [[ -n "$UNTIL_ISO" ]]; then
-                FILTER="${FILTER};to=${UNTIL_ISO}"
+                URL="${URL}&to=${UNTIL_ISO}"
             fi
-
-            URL="${CM_URL}/api/v33/clusters/${CM_CLUSTER_ENC}/services/yarn/yarnApplications?filter=${FILTER}&limit=${LIMIT}&offset=${CM_OFFSET}"
 
             RESPONSE=$(curl $CURL_OPTS -u "${CM_USER}:${CM_PASS}" "$URL" 2>/dev/null) || {
                 echo "[yarn] WARN: CM request failed at offset=${CM_OFFSET}" >&2
