@@ -14,6 +14,7 @@ from __future__ import print_function
 import argparse
 import csv
 import datetime as dt
+import getpass
 import os
 import sys
 import time
@@ -146,7 +147,8 @@ def main():
     ap.add_argument("--auth-mode", choices=["basic", "kerberos", "none"], default="none",
                     help="Authentication mode (default: none)")
     ap.add_argument("--user", default="", help="Username for basic auth")
-    ap.add_argument("--password", default="", help="Password for basic auth")
+    ap.add_argument("--password", default="",
+                    help="Password for basic auth (leave empty to be prompted securely)")
     ap.add_argument("--verify-tls", action="store_true", default=False,
                     help="Verify TLS certificates")
     ap.add_argument("--since", default=None,
@@ -166,6 +168,9 @@ def main():
     if requests is None:
         print("ERROR: requests not installed. Run: pip install requests", file=sys.stderr)
         sys.exit(1)
+
+    if args.auth_mode == "basic" and args.user and not args.password:
+        args.password = getpass.getpass("Password for {}: ".format(args.user))
 
     session = mk_session(args.auth_mode, args.user, args.password, args.verify_tls)
 
