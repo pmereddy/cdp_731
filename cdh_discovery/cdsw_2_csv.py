@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Python 3.6.8 compatible.
+Queries the CDSW/CML Admin API (v1 or v2) to enumerate projects, jobs,
+sessions, models, and applications, and produces two CSVs compatible with
+load_neo4j.py:
+
+  - dependency_objects CSV  (projects as CDPObjects)
+  - dependency_access  CSV  (jobs/sessions/models as access events)
+
+Usage examples:
+
+  # v2 API key (default) -- use this if you created a key from CDSW UI
+  python3 cdsw_2_csv.py \\
+      --cdsw-url https://cdsw.example.com \\
+      --api-key <ADMIN_API_KEY> \\
+      --out-objects cdsw_objects.csv \\
+      --out-access  cdsw_access.csv
+
+  # v1 API (legacy)
+  python3 cdsw_2_csv.py \\
+      --cdsw-url https://cdsw.example.com \\
+      --api-key <V1_KEY> --api-version v1
+
+  # Basic auth, limit to 50 projects
+  python3 cdsw_2_csv.py \\
+      --cdsw-url https://cdsw.example.com \\
+      --auth-mode basic --user admin --password secret \\
+      --max-projects 50
+
+  # Skip sessions (can be very large)
+  python3 cdsw_2_csv.py \\
+      --cdsw-url https://cdsw.example.com \\
+      --api-key <KEY> --skip-sessions
+
+CDH 6.x / legacy Cloudera Data Science Workbench (CDSW):
+  - Prefer --api-version v1.  Many CDH 6.3 clusters only expose the v1 REST API
+    (/api/v1/projects, owner/slug URLs).  v2 (/api/v2/projects) may be absent
+    or behave differently than Cloudera Machine Learning (CML).
+  - Create an API key from the CDSW UI (Site Administration / your profile,
+    depending on version) and pass it with --api-key, or use --auth-mode basic.
+  - If v2 returns 404 or empty projects, switch to v1 immediately.
+"""
+
+from __future__ import print_function
+
+import argparse
+import csv
+import json
+import os
+import sys
+import time
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+OBJECTS_FIELDS = [
+    "service", "object_type", "object_id", "owner", "group", "extra",
+]
+
+ACCESS_FIELDS = [
+    "window_start", "service", "user", "do_as", "client_ip",
+    "app_name", "op", "object_type", "object_id", "cnt",
+]
+
+
+def mk_session(auth_mode, api_key, user, password, verify_tls):
+    s = requests.Session()
+    s.verify = verify_tls
+    if api_key:
+        s.headers["Authorization"] = "Bearer {}".format(api_key)
+    elif auth_mode == "basic" and user:
+        s.auth = (user, password)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# v1 pagination
+# ---------------------------------------------------------------------------
+
+def paginate_v1(session, url, key, page_size=100, sleep_ms=100, max_items=0):
+    """v1 API paginated GET. Yields items from response[key]."""
+    offset = 0
+    total = 0
+    while True:
+        params = {"pageSize": page_size, "pageToken": offset}
+        try:
+            resp = session.get(url, params=params, timeout=60)
+        except Exception as e:
+            print("[cdsw] ERROR fetching {}: {}".format(url, e), file=sys.stderr)
+            break
+        if not resp.ok:
+            print("[cdsw] HTTP {}: {} (url={})".format(
+                resp.status_code, resp.text[:300], url), file=sys.stderr)
+            break
+
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get(key) or []
+        if not items:
+            break
+
+        for item in items:
+            yield item
+            total += 1
+            if 0 < max_items <= total:
+                return
+
+        if isinstance(data, list) or len(items) < page_size:
+            break
+        offset += page_size
+        if sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# v2 pagination
+# ---------------------------------------------------------------------------
+
+def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0,
+                extra_params=None):
+    """v2 API paginated GET. Uses page_size / page_token params."""
+    page_token = ""
+    total = 0
+    while True:
+        params = {"page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+        if extra_params:
+            params.update(extra_params)
+        try:
+            resp = session.get(url, params=params, timeout=60)
+        except Exception as e:
+            print("[cdsw] ERROR fetching {}: {}".format(url, e), file=sys.stderr)
+            break
+        if not resp.ok:
+            print("[cdsw] HTTP {}: {} (url={})".format(
+                resp.status_code, resp.text[:300], url), file=sys.stderr)
+            break
+
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get(key) or []
+        if not items:
+            break
+
+        for item in items:
+            yield item
+            total += 1
+            if 0 < max_items <= total:
+                return
+
+        if isinstance(data, list):
+            break
+        next_token = data.get("next_page_token") or ""
+        if not next_token or len(items) < page_size:
+            break
+        page_token = next_token
+        if sleep_ms > 0:
+            time.sleep(sleep_ms / 1000.0)
+
+
+# ---------------------------------------------------------------------------
+# Fetch helpers -- dispatch to v1 or v2
+# ---------------------------------------------------------------------------
+
+def fetch_projects(session, base_url, api_ver, page_size, sleep_ms,
+                   max_projects):
+    if api_ver == "v2":
+        url = "{}/api/v2/projects".format(base_url)
+        # search_filter tells v2 API to include ALL projects (not just yours)
+        extra = {"search_filter": json.dumps({"include_public_projects": True})}
+        projects = list(paginate_v2(session, url, "projects",
+                                    page_size=page_size, sleep_ms=sleep_ms,
+                                    max_items=max_projects,
+                                    extra_params=extra))
+        if not projects:
+            print("[cdsw] Retrying without search_filter...", file=sys.stderr)
+            projects = list(paginate_v2(session, url, "projects",
+                                        page_size=page_size, sleep_ms=sleep_ms,
+                                        max_items=max_projects))
+    else:
+        url = "{}/api/v1/projects".format(base_url)
+        projects = list(paginate_v1(session, url, "projects",
+                                    page_size=page_size, sleep_ms=sleep_ms,
+                                    max_items=max_projects))
+    print("[cdsw] Fetched {} projects".format(len(projects)), file=sys.stderr)
+    return projects
+
+
+def _sub_url(base_url, api_ver, proj, resource):
+    """Build URL for a project sub-resource (jobs, sessions, etc.)."""
+    if api_ver == "v2":
+        proj_id = proj.get("id") or proj.get("project_id") or ""
+        return "{}/api/v2/projects/{}/{}".format(base_url, proj_id, resource)
+    owner = _proj_owner(proj)
+    slug = proj.get("slug") or proj.get("name") or ""
+    return "{}/api/v1/projects/{}/{}/{}".format(base_url, owner, slug, resource)
+
+
+def _paginator(api_ver):
+    return paginate_v2 if api_ver == "v2" else paginate_v1
+
+
+def fetch_jobs(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "jobs")
+    return list(_paginator(api_ver)(session, url, "jobs",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def fetch_sessions(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "sessions")
+    return list(_paginator(api_ver)(session, url, "sessions",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def fetch_models(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "models")
+    return list(_paginator(api_ver)(session, url, "models",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def fetch_applications(session, base_url, api_ver, proj, page_size, sleep_ms):
+    url = _sub_url(base_url, api_ver, proj, "applications")
+    return list(_paginator(api_ver)(session, url, "applications",
+                                    page_size=page_size, sleep_ms=sleep_ms))
+
+
+def _proj_owner(proj):
+    """Extract owner username from v1 or v2 project dict."""
+    owner = proj.get("owner", {})
+    if isinstance(owner, dict):
+        return owner.get("username") or owner.get("name") or ""
+    return str(owner) if owner else ""
+
+
+def safe_ts(val):
+    """Return ISO timestamp or empty string."""
+    if not val:
+        return ""
+    s = str(val)
+    if "T" in s:
+        return s[:19] + "Z" if len(s) >= 19 else s
+    return s
+
+
+def project_id(proj):
+    """Build a stable project identifier: owner/name."""
+    owner_name = _proj_owner(proj) or "unknown"
+    proj_name = proj.get("name") or proj.get("slug") or "unnamed"
+    return "{}/{}".format(owner_name, proj_name)
+
+
+def project_extra(proj):
+    """Build pipe-delimited extra metadata."""
+    parts = []
+    desc = (proj.get("description") or "").replace("|", " ").replace("\n", " ")[:120]
+    if desc:
+        parts.append("desc={}".format(desc))
+    engine = proj.get("default_engine_type") or ""
+    if engine:
+        parts.append("engine={}".format(engine))
+    created = safe_ts(proj.get("created_at") or proj.get("createdAt"))
+    if created:
+        parts.append("created={}".format(created))
+    return "|".join(parts)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Export CDSW projects, jobs, sessions, models to CSV."
+    )
+    ap.add_argument("--cdsw-url", required=True,
+                    help="CDSW base URL (e.g. https://cdsw.example.com)")
+    ap.add_argument("--api-key", default="",
+                    help="CDSW API key (admin key sees all projects)")
+    ap.add_argument("--api-version", choices=["v1", "v2"], default="v2",
+                    help="CDSW API version: v2 (default) for keys created in "
+                         "CDSW UI; v1 for legacy keys")
+    ap.add_argument("--auth-mode", choices=["basic", "none"], default="none",
+                    help="Auth mode if not using API key (default: none)")
+    ap.add_argument("--user", default="", help="Username for basic auth")
+    ap.add_argument("--password", default="", help="Password for basic auth")
+    ap.add_argument("--verify-tls", action="store_true", default=False,
+                    help="Verify TLS certificates (default: skip)")
+    ap.add_argument("--page-size", type=int, default=100,
+                    help="API page size (default: 100)")
+    ap.add_argument("--sleep-ms", type=int, default=100,
+                    help="Sleep between API calls in ms (default: 100)")
+    ap.add_argument("--max-projects", type=int, default=0,
+                    help="Max projects to enumerate; 0 = all (default: 0)")
+    ap.add_argument("--skip-sessions", action="store_true", default=False,
+                    help="Skip collecting sessions (can be very large)")
+    ap.add_argument("--skip-models", action="store_true", default=False,
+                    help="Skip collecting models")
+    ap.add_argument("--skip-applications", action="store_true", default=False,
+                    help="Skip collecting CDSW applications (web apps)")
+    ap.add_argument("--out-objects", default="cdsw_objects.csv",
+                    help="Output objects CSV (default: cdsw_objects.csv)")
+    ap.add_argument("--out-access", default="cdsw_access.csv",
+                    help="Output access CSV (default: cdsw_access.csv)")
+    args = ap.parse_args()
+
+    if requests is None:
+        print("ERROR: requests not installed. Run: pip install requests",
+              file=sys.stderr)
+        sys.exit(1)
+
+    base_url = args.cdsw_url.rstrip("/")
+    api_ver = args.api_version
+    session = mk_session(args.auth_mode, args.api_key,
+                         args.user, args.password, args.verify_tls)
+
+    print("[cdsw] Using API {} at {}".format(api_ver, base_url), file=sys.stderr)
+    projects = fetch_projects(session, base_url, api_ver, args.page_size,
+                              args.sleep_ms, args.max_projects)
+    if not projects:
+        print("[cdsw] No projects found. Check URL and credentials.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    for d in (args.out_objects, args.out_access):
+        out_dir = os.path.dirname(os.path.abspath(d))
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir)
+
+    obj_rows = []
+    access_rows = []
+
+    for idx, proj in enumerate(projects):
+        pid = project_id(proj)
+        owner = _proj_owner(proj)
+
+        obj_rows.append({
+            "service": "cdsw",
+            "object_type": "cdsw_project",
+            "object_id": pid,
+            "owner": owner,
+            "group": "",
+            "extra": project_extra(proj),
+        })
+
+        # --- Jobs (scheduled / manual) ---
+        jobs = fetch_jobs(session, base_url, api_ver, proj,
+                          args.page_size, args.sleep_ms)
+        for job in jobs:
+            job_name = job.get("name") or job.get("title") or ""
+            script = job.get("script") or ""
+            kernel = job.get("kernel") or job.get("engine_type") or ""
+            schedule = job.get("schedule") or ""
+
+            extra_parts = []
+            if script:
+                extra_parts.append("script={}".format(script))
+            if kernel:
+                extra_parts.append("engine={}".format(kernel))
+            if schedule:
+                extra_parts.append("schedule={}".format(
+                    schedule.replace("|", " ")))
+
+            access_rows.append({
+                "window_start": safe_ts(
+                    job.get("latest", {}).get("started_at") or
+                    job.get("updated_at") or job.get("created_at")),
+                "service": "cdsw",
+                "user": owner,
+                "do_as": "",
+                "client_ip": "",
+                "app_name": job_name,
+                "op": "JOB",
+                "object_type": "cdsw_project",
+                "object_id": pid,
+                "cnt": 1,
+            })
+
+            obj_rows.append({
+                "service": "cdsw",
+                "object_type": "cdsw_job",
+                "object_id": "{}/{}".format(pid, job_name or job.get("id", "")),
+                "owner": owner,
+                "group": "",
+                "extra": "|".join(extra_parts),
+            })
+
+        # --- Sessions (interactive) ---
+        if not args.skip_sessions:
+            sessions = fetch_sessions(session, base_url, api_ver, proj,
+                                      args.page_size, args.sleep_ms)
+            for sess in sessions:
+                sess_user = (sess.get("owner", {}).get("username") or
+                             sess.get("owner", {}).get("name") or owner)
+                kernel = sess.get("kernel") or sess.get("engine_type") or ""
+                access_rows.append({
+                    "window_start": safe_ts(
+                        sess.get("created_at") or sess.get("createdAt")),
+                    "service": "cdsw",
+                    "user": sess_user,
+                    "do_as": "",
+                    "client_ip": "",
+                    "app_name": "session:{}".format(kernel),
+                    "op": "SESSION",
+                    "object_type": "cdsw_project",
+                    "object_id": pid,
+                    "cnt": 1,
+                })
+
+        # --- Models ---
+        if not args.skip_models:
+            models = fetch_models(session, base_url, api_ver, proj,
+                                  args.page_size, args.sleep_ms)
+            for model in models:
+                model_name = model.get("name") or ""
+                access_rows.append({
+                    "window_start": safe_ts(
+                        model.get("updated_at") or model.get("created_at")),
+                    "service": "cdsw",
+                    "user": owner,
+                    "do_as": "",
+                    "client_ip": "",
+                    "app_name": model_name,
+                    "op": "MODEL",
+                    "object_type": "cdsw_project",
+                    "object_id": pid,
+                    "cnt": 1,
+                })
+
+                obj_rows.append({
+                    "service": "cdsw",
+                    "object_type": "cdsw_model",
+                    "object_id": "{}/model:{}".format(pid, model_name or model.get("id", "")),
+                    "owner": owner,
+                    "group": "",
+                    "extra": "",
+                })
+
+        # --- Applications (web apps) ---
+        if not args.skip_applications:
+            cdsw_apps = fetch_applications(
+                session, base_url, api_ver, proj,
+                args.page_size, args.sleep_ms)
+            for app in cdsw_apps:
+                app_name = app.get("name") or ""
+                access_rows.append({
+                    "window_start": safe_ts(
+                        app.get("updated_at") or app.get("created_at")),
+                    "service": "cdsw",
+                    "user": owner,
+                    "do_as": "",
+                    "client_ip": "",
+                    "app_name": app_name,
+                    "op": "APPLICATION",
+                    "object_type": "cdsw_project",
+                    "object_id": pid,
+                    "cnt": 1,
+                })
+
+        if (idx + 1) % 10 == 0 or idx + 1 == len(projects):
+            print("[cdsw] Processed {}/{} projects ({} objects, {} access rows)".format(
+                idx + 1, len(projects), len(obj_rows), len(access_rows)),
+                file=sys.stderr)
+
+    # --- Write objects CSV ---
+    with open(args.out_objects, "w", newline="") as fout:
+        writer = csv.DictWriter(fout, fieldnames=OBJECTS_FIELDS)
+        writer.writeheader()
+        for row in obj_rows:
+            writer.writerow(row)
+    print("[cdsw] Wrote {} object rows to {}".format(
+        len(obj_rows), args.out_objects), file=sys.stderr)
+
+    # --- Write access CSV ---
+    with open(args.out_access, "w", newline="") as fout:
+        writer = csv.DictWriter(fout, fieldnames=ACCESS_FIELDS)
+        writer.writeheader()
+        for row in access_rows:
+            writer.writerow(row)
+    print("[cdsw] Wrote {} access rows to {}".format(
+        len(access_rows), args.out_access), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
