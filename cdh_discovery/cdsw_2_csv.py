@@ -67,11 +67,28 @@ ACCESS_FIELDS = [
 ]
 
 
-def mk_session(auth_mode, api_key, user, password, verify_tls):
+def _mk_bearer_session(api_key, verify_tls):
+    s = requests.Session()
+    s.verify = verify_tls
+    s.headers["Authorization"] = "Bearer {}".format(api_key)
+    return s
+
+
+def _mk_basic_session(user, password, verify_tls):
+    s = requests.Session()
+    s.verify = verify_tls
+    s.auth = (user, password)
+    return s
+
+
+def mk_session(auth_mode, api_key, user, password, verify_tls, api_ver="v2"):
     s = requests.Session()
     s.verify = verify_tls
     if api_key:
-        s.headers["Authorization"] = "Bearer {}".format(api_key)
+        if api_ver == "v1":
+            s.auth = (api_key, api_key)
+        else:
+            s.headers["Authorization"] = "Bearer {}".format(api_key)
     elif auth_mode == "basic" and user:
         s.auth = (user, password)
     return s
@@ -138,6 +155,10 @@ def paginate_v2(session, url, key, page_size=100, sleep_ms=100, max_items=0,
         if not resp.ok:
             print("[cdsw] HTTP {}: {} (url={})".format(
                 resp.status_code, resp.text[:300], url), file=sys.stderr)
+            if resp.status_code == 400 and extra_params:
+                print("[cdsw] Hint: server rejected query params, "
+                      "likely older CDSW without search_filter support",
+                      file=sys.stderr)
             break
 
         data = resp.json()
@@ -169,15 +190,35 @@ def fetch_projects(session, base_url, api_ver, page_size, sleep_ms,
                    max_projects):
     if api_ver == "v2":
         url = "{}/api/v2/projects".format(base_url)
-        # search_filter tells v2 API to include ALL projects (not just yours)
+        projects = []
+
+        # Try 1: search_filter (works on CML / newer CDSW)
         extra = {"search_filter": json.dumps({"include_public_projects": True})}
-        projects = list(paginate_v2(session, url, "projects",
-                                    page_size=page_size, sleep_ms=sleep_ms,
-                                    max_items=max_projects,
-                                    extra_params=extra))
-        if not projects:
-            print("[cdsw] Retrying without search_filter...", file=sys.stderr)
+        try:
             projects = list(paginate_v2(session, url, "projects",
+                                        page_size=page_size, sleep_ms=sleep_ms,
+                                        max_items=max_projects,
+                                        extra_params=extra))
+        except Exception:
+            pass
+
+        # Try 2: v2 without search_filter (returns caller's projects only)
+        if not projects:
+            print("[cdsw] Retrying v2 without search_filter...", file=sys.stderr)
+            try:
+                projects = list(paginate_v2(session, url, "projects",
+                                            page_size=page_size, sleep_ms=sleep_ms,
+                                            max_items=max_projects))
+            except Exception:
+                pass
+
+        # Try 3: fall back to v1 API (best for CDH 6.3.3 / older CDSW)
+        if not projects:
+            print("[cdsw] v2 returned no projects, falling back to v1 API...",
+                  file=sys.stderr)
+            api_ver = "v1"
+            url = "{}/api/v1/projects".format(base_url)
+            projects = list(paginate_v1(session, url, "projects",
                                         page_size=page_size, sleep_ms=sleep_ms,
                                         max_items=max_projects))
     else:
@@ -185,7 +226,8 @@ def fetch_projects(session, base_url, api_ver, page_size, sleep_ms,
         projects = list(paginate_v1(session, url, "projects",
                                     page_size=page_size, sleep_ms=sleep_ms,
                                     max_items=max_projects))
-    print("[cdsw] Fetched {} projects".format(len(projects)), file=sys.stderr)
+    print("[cdsw] Fetched {} projects (api={})".format(len(projects), api_ver),
+          file=sys.stderr)
     return projects
 
 
@@ -310,14 +352,56 @@ def main():
     base_url = args.cdsw_url.rstrip("/")
     api_ver = args.api_version
     session = mk_session(args.auth_mode, args.api_key,
-                         args.user, args.password, args.verify_tls)
+                         args.user, args.password, args.verify_tls,
+                         api_ver=api_ver)
 
     print("[cdsw] Using API {} at {}".format(api_ver, base_url), file=sys.stderr)
     projects = fetch_projects(session, base_url, api_ver, args.page_size,
                               args.sleep_ms, args.max_projects)
+
+    # If v1 auth failed (401), retry with alternate auth strategies
+    if not projects and args.api_key:
+        auth_strategies = [
+            ("Bearer token", lambda: _mk_bearer_session(
+                args.api_key, args.verify_tls)),
+            ("basic (key as user+pass)", lambda: _mk_basic_session(
+                args.api_key, args.api_key, args.verify_tls)),
+            ("basic (key as pass only)", lambda: _mk_basic_session(
+                "", args.api_key, args.verify_tls)),
+        ]
+        for name, mk_fn in auth_strategies:
+            print("[cdsw] Retrying with auth: {} ...".format(name),
+                  file=sys.stderr)
+            session = mk_fn()
+            # Try both v1 and v2
+            for ver in [api_ver, "v1", "v2"]:
+                url = "{}/api/{}/projects".format(base_url, ver)
+                pager = paginate_v2 if ver == "v2" else paginate_v1
+                try:
+                    test = list(pager(session, url, "projects",
+                                     page_size=5, sleep_ms=0, max_items=5))
+                    if test:
+                        print("[cdsw] Success with auth={}, api={}".format(
+                            name, ver), file=sys.stderr)
+                        api_ver = ver
+                        projects = fetch_projects(session, base_url, api_ver,
+                                                  args.page_size, args.sleep_ms,
+                                                  args.max_projects)
+                        break
+                except Exception:
+                    pass
+            if projects:
+                break
+
     if not projects:
         print("[cdsw] No projects found. Check URL and credentials.",
               file=sys.stderr)
+        print("[cdsw] Troubleshooting:", file=sys.stderr)
+        print("[cdsw]   1. Verify the URL opens in a browser", file=sys.stderr)
+        print("[cdsw]   2. Try: curl -k -u '<api_key>:<api_key>' "
+              "{}/api/v1/projects?pageSize=5".format(base_url), file=sys.stderr)
+        print("[cdsw]   3. Try: curl -k -H 'Authorization: Bearer <api_key>' "
+              "{}/api/v2/projects?page_size=5".format(base_url), file=sys.stderr)
         sys.exit(1)
 
     for d in (args.out_objects, args.out_access):
